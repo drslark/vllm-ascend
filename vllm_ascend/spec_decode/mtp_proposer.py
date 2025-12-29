@@ -1,11 +1,18 @@
-﻿from typing import Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-from vllm.config import CUDAGraphMode
-from vllm.distributed import get_pcp_group
+from vllm.config import (CUDAGraphMode, get_layers_from_vllm_config,
+                         set_current_vllm_config)
+from vllm.distributed import get_pcp_group, get_pp_group
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    process_weights_after_loading)
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+from vllm.model_executor.utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -14,7 +21,11 @@ from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
+                                               update_attn_dcp_pcp_params,
+                                               update_attn_params,
+                                               update_mla_attn_dcp_pcp_params,
+                                               update_mla_attn_params)
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.utils import ProfileExecuteDuration, lmhead_tp_enable
@@ -24,6 +35,82 @@ class MtpProposer(EagleProposer):
 
     # TODO: Find out why ModelRunner does not this explicit typing?
     model: Union[nn.Module, ACLGraphWrapper]
+
+    # update full-graph params for one spec token
+    def _update_full_graph_params(self, forward_context, num_tokens):
+        if self.vllm_config.model_config.use_mla:
+            if self.pcp_size * self.dcp_size > 1:
+                update_mla_attn_dcp_pcp_params(self.update_stream,
+                                               forward_context, num_tokens)
+            else:
+                update_mla_attn_params(self.update_stream, forward_context,
+                                       num_tokens,
+                                       self.vllm_config.speculative_config)
+        else:
+            if self.pcp_size * self.dcp_size > 1:
+                update_attn_dcp_pcp_params(self.update_stream, forward_context,
+                                           num_tokens)
+            else:
+                update_attn_params(self.update_stream, forward_context,
+                                   num_tokens, self.vllm_config)
+
+    def load_model(self, model) -> None:
+        loader = get_model_loader(self.vllm_config.load_config)
+
+        target_attn_layer_names = set(
+            get_layers_from_vllm_config(self.vllm_config,
+                                        AttentionLayerBase).keys())
+        target_indexer_layer_names = set(
+            get_layers_from_vllm_config(self.vllm_config,
+                                        DeepseekV32IndexerCache).keys())
+        draft_model_config = \
+            self.vllm_config.speculative_config.draft_model_config
+        target_device = self.vllm_config.device_config.device
+
+        with set_default_torch_dtype(
+                draft_model_config.dtype), set_current_vllm_config(
+                    self.vllm_config):
+            self._init_mtp_model()
+        draft_attn_layer_names = (get_layers_from_vllm_config(
+            self.vllm_config, AttentionLayerBase).keys() -
+                                  target_attn_layer_names)
+        indexer_layers = get_layers_from_vllm_config(self.vllm_config,
+                                                     DeepseekV32IndexerCache)
+        draft_indexer_layer_names = indexer_layers.keys(
+        ) - target_indexer_layer_names
+        # NOTE: Currently we don't have specific attention backend and attention metadata
+        # for deepseek v3.2 indexer, so we just exclude the indexer layers here.
+        draft_attn_layer_names = draft_attn_layer_names - draft_indexer_layer_names
+
+        assert len(draft_attn_layer_names) == 1
+        self.attn_layer_name = list(draft_attn_layer_names)
+
+        self.model.load_weights(
+            loader.get_all_weights(
+                self.vllm_config.speculative_config.draft_model_config,
+                self.model))
+        process_weights_after_loading(self.model, draft_model_config,
+                                      target_device)
+
+        if self.vllm_config.model_config.is_deepseek_mla:
+            # check if mtp model use main model's embedding and LMhead
+            main_model = model
+            if get_pp_group().world_size == 1:
+                # If pp>1, the weights of mtp and the main model's embedding are not on the same device.
+                if torch.equal(self.model.model.embed_tokens.weight,
+                               main_model.model.embed_tokens.weight):
+                    self.model.model.embed_tokens = main_model.model.embed_tokens
+            for _, layer_module in self.model.model.layers.items():
+                if torch.equal(layer_module.shared_head.head.weight,
+                               main_model.lm_head.weight):
+                    layer_module.shared_head.head = main_model.lm_head
+
+        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs(
+        ):
+            self.update_stream: torch.npu.Stream = torch.npu.Stream()
+            self.model = ACLGraphWrapper(self.model,
+                                         self.vllm_config,
+                                         runtime_mode=CUDAGraphMode.FULL)
 
     @torch.inference_mode()
     def dummy_run(self,
@@ -122,8 +209,16 @@ class MtpProposer(EagleProposer):
                     not forward_context.capturing and not self.use_sparse:
                     self._update_full_graph_params(forward_context, num_tokens)
 
+<<<<<<< HEAD
                 previous_hidden_states, positions, _ = self.maybe_all_gather_and_unpad(
                     previous_hidden_states, positions)
+=======
+                if self.enable_shared_expert_dp:
+                    positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                        positions, True)
+                    previous_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                        previous_hidden_states, True)
+>>>>>>> cdf7dbc3 ([Feat][main] Supported to use full-graph with Qwen3-Next-MTP)
                 dummy_compute_logits(previous_hidden_states)
             if with_prefill:
                 break
@@ -317,8 +412,31 @@ class MtpProposer(EagleProposer):
                     positions = self.positions[:num_input_tokens]
                     hidden_states = self.hidden_states[:num_input_tokens]
 
+<<<<<<< HEAD
                     hidden_states, positions = self.maybe_pad_and_reduce(
                         hidden_states, positions)
+=======
+                    if self.enable_shared_expert_dp:
+                        # positions [N] -> [N, 1] for padding
+                        positions = positions.unsqueeze(-1)
+                        positions = torch.ops.vllm.maybe_pad_and_reduce(
+                            positions)
+                        positions = positions.squeeze(-1)
+                        hidden_states = torch.ops.vllm.maybe_pad_and_reduce(
+                            hidden_states)
+
+                    for layer_name in self.attn_layer_name:
+                        decode_metadata = getattr(attn_metadata[layer_name],
+                                                  "decode", None)
+                        if not self.use_cuda_graph and decode_metadata is not None:
+                            actual_size = len(
+                                decode_metadata.actual_seq_lengths_q)
+
+                            decode_metadata.seq_lens_list = \
+                                decode_metadata.seq_lens_list[:actual_size]
+                            decode_metadata.block_table = \
+                                decode_metadata.block_table[:actual_size]
+>>>>>>> cdf7dbc3 ([Feat][main] Supported to use full-graph with Qwen3-Next-MTP)
 
                     hidden_states = self.model(input_ids=input_ids,
                                                positions=positions,
