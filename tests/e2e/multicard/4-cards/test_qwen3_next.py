@@ -57,8 +57,6 @@ def test_qwen3_next_distributed_mp_full_decode_only_tp4():
         del vllm_model
 
 
-<<<<<<< HEAD:tests/e2e/multicard/4-cards/test_qwen3_next.py
-=======
 def test_qwen3_next_distributed_mp_eager_mtp_similarity_tp4():
     example_prompts = [
         "Hello, my name is",
@@ -115,7 +113,6 @@ def test_qwen3_next_distributed_mp_eager_mtp_similarity_tp4():
     assert matches > int(0.66 * len(ref_outputs))
 
 
->>>>>>> cdf7dbc3 ([Feat][main] Supported to use full-graph with Qwen3-Next-MTP):tests/e2e/multicard/test_qwen3_next.py
 # TODO: will conduct accuracy verification after the subsequent version becomes stable
 @patch.dict(os.environ, {"HCCL_BUFFSIZE": "1024"})
 def test_qwen3_next_w8a8dynamic_distributed_tp4_ep():

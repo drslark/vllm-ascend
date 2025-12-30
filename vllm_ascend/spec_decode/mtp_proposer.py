@@ -22,10 +22,7 @@ from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
-                                               update_attn_dcp_pcp_params,
-                                               update_attn_params,
-                                               update_mla_attn_dcp_pcp_params,
-                                               update_mla_attn_params)
+                                               update_full_graph_params)
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.utils import ProfileExecuteDuration, lmhead_tp_enable
@@ -35,24 +32,6 @@ class MtpProposer(EagleProposer):
 
     # TODO: Find out why ModelRunner does not this explicit typing?
     model: Union[nn.Module, ACLGraphWrapper]
-
-    # update full-graph params for one spec token
-    def _update_full_graph_params(self, forward_context, num_tokens):
-        if self.vllm_config.model_config.use_mla:
-            if self.pcp_size * self.dcp_size > 1:
-                update_mla_attn_dcp_pcp_params(self.update_stream,
-                                               forward_context, num_tokens)
-            else:
-                update_mla_attn_params(self.update_stream, forward_context,
-                                       num_tokens,
-                                       self.vllm_config.speculative_config)
-        else:
-            if self.pcp_size * self.dcp_size > 1:
-                update_attn_dcp_pcp_params(self.update_stream, forward_context,
-                                           num_tokens)
-            else:
-                update_attn_params(self.update_stream, forward_context,
-                                   num_tokens, self.vllm_config)
 
     def load_model(self, model) -> None:
         loader = get_model_loader(self.vllm_config.load_config)
@@ -207,18 +186,16 @@ class MtpProposer(EagleProposer):
                 forward_context = get_forward_context()
                 if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
                     not forward_context.capturing and not self.use_sparse:
-                    self._update_full_graph_params(forward_context, num_tokens)
+                    update_full_graph_params(
+                        self.update_stream, forward_context, num_tokens,
+                        self.vllm_config, self.vllm_config.speculative_config,
+                        self.pcp_size, self.dcp_size)
 
-<<<<<<< HEAD
-                previous_hidden_states, positions, _ = self.maybe_all_gather_and_unpad(
-                    previous_hidden_states, positions)
-=======
                 if self.enable_shared_expert_dp:
                     positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                         positions, True)
                     previous_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                         previous_hidden_states, True)
->>>>>>> cdf7dbc3 ([Feat][main] Supported to use full-graph with Qwen3-Next-MTP)
                 dummy_compute_logits(previous_hidden_states)
             if with_prefill:
                 break
@@ -412,10 +389,6 @@ class MtpProposer(EagleProposer):
                     positions = self.positions[:num_input_tokens]
                     hidden_states = self.hidden_states[:num_input_tokens]
 
-<<<<<<< HEAD
-                    hidden_states, positions = self.maybe_pad_and_reduce(
-                        hidden_states, positions)
-=======
                     if self.enable_shared_expert_dp:
                         # positions [N] -> [N, 1] for padding
                         positions = positions.unsqueeze(-1)
@@ -436,15 +409,17 @@ class MtpProposer(EagleProposer):
                                 decode_metadata.seq_lens_list[:actual_size]
                             decode_metadata.block_table = \
                                 decode_metadata.block_table[:actual_size]
->>>>>>> cdf7dbc3 ([Feat][main] Supported to use full-graph with Qwen3-Next-MTP)
 
                     hidden_states = self.model(input_ids=input_ids,
                                                positions=positions,
                                                hidden_states=hidden_states)
                     forward_context = get_forward_context()
                     if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not self.use_sparse:
-                        self._update_full_graph_params(forward_context,
-                                                       num_input_tokens)
+                        update_full_graph_params(
+                            self.update_stream, forward_context,
+                            num_input_tokens, self.vllm_config,
+                            self.vllm_config.speculative_config, self.pcp_size,
+                            self.dcp_size)
 
                     hidden_states, positions, _ = self.maybe_all_gather_and_unpad(
                         hidden_states, positions)
