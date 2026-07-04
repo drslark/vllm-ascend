@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections import defaultdict
 from copy import copy
 from typing import Any
@@ -22,31 +21,10 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_co
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.llm_base_proposer import greedy_sample
-from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
-
-
-def _dspark_reject_debug_enabled() -> bool:
-    return envs.VLLM_ASCEND_DSPARK_REJECT_DEBUG
 
 
 def _dspark_standard_dsa_enabled() -> bool:
     return not envs.VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE
-
-
-def _dspark_accept_debug_enabled() -> bool:
-    return bool(os.getenv("VLLM_ASCEND_DSPARK_ACCEPT_DEBUG_PATH"))
-
-
-def _dspark_accept_debug_topk() -> int:
-    try:
-        return max(0, int(os.getenv("VLLM_ASCEND_DSPARK_ACCEPT_DEBUG_TOPK", "5")))
-    except ValueError:
-        return 5
-
-
-def _debug_tensor_head(name: str, tensor: torch.Tensor, limit: int = 16) -> str:
-    flat = tensor.detach().flatten()
-    return f"{name}={flat[:limit].cpu().tolist()}"
 
 
 def _dspark_reduce_sample_enabled() -> bool:
@@ -79,10 +57,11 @@ class AscendDSparkProposer(AscendDflashProposer):
         super().__init__(vllm_config, device, runner=runner)
         assert vllm_config.speculative_config is not None
         draft_hf_config = vllm_config.speculative_config.draft_model_config.hf_config
-        self._dspark_probabilistic = vllm_config.speculative_config.draft_sample_method == "probabilistic"
-        self._dspark_last_draft_logits: torch.Tensor | None = None
-        self._dspark_last_draft_probs: torch.Tensor | None = None
-        self._dspark_last_draft_logit_components: dict[str, torch.Tensor] | None = None
+        if vllm_config.speculative_config.draft_sample_method == "probabilistic":
+            raise ValueError(
+                "DSpark probabilistic draft sampling is not supported on the v1 "
+                "model runner; use greedy (the default) instead."
+            )
         dspark_target_layer_ids = getattr(draft_hf_config, "dspark_target_layer_ids", None)
         if dspark_target_layer_ids:
             self.hidden_size = vllm_config.speculative_config.draft_model_config.get_hidden_size() * len(
@@ -151,16 +130,6 @@ class AscendDSparkProposer(AscendDflashProposer):
             dtype=torch.int64,
             device=device,
         )
-        self._dspark_sampling_seed_buffer = torch.zeros(
-            self.max_batch_size,
-            dtype=torch.int64,
-            device=device,
-        )
-        self._dspark_idx_mapping_buffer = torch.arange(
-            self.max_batch_size,
-            dtype=torch.int32,
-            device=device,
-        )
         self._dspark_token_to_req_indices_buffer = torch.zeros(
             self.max_query_tokens,
             dtype=torch.int32,
@@ -197,106 +166,6 @@ class AscendDSparkProposer(AscendDflashProposer):
             self.max_positions + 1,
             device=device,
             dtype=torch.int32,
-        )
-
-    def take_last_draft_logits(self) -> torch.Tensor | None:
-        draft_logits = self._dspark_last_draft_logits
-        self._dspark_last_draft_logits = None
-        return draft_logits
-
-    def take_last_draft_probs(self) -> torch.Tensor | None:
-        draft_probs = self._dspark_last_draft_probs
-        self._dspark_last_draft_probs = None
-        return draft_probs
-
-    def take_last_draft_logit_components(self) -> dict[str, torch.Tensor] | None:
-        draft_logit_components = self._dspark_last_draft_logit_components
-        self._dspark_last_draft_logit_components = None
-        return draft_logit_components
-
-    def _get_draft_sampling_temperature(
-        self,
-        sampling_metadata: SamplingMetadata,
-        num_reqs: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        temperature = sampling_metadata.temperature
-        if temperature is None:
-            default = 0.0 if sampling_metadata.all_greedy else 1.0
-            return torch.full((num_reqs,), default, dtype=torch.float32, device=device)
-        return temperature[:num_reqs].to(device=device, dtype=torch.float32).contiguous()
-
-    def _get_runner_sampling_state_seeds(self, num_reqs: int, device: torch.device) -> torch.Tensor | None:
-        runner = getattr(self, "runner", None)
-        sampler = getattr(runner, "sampler", None)
-        sampling_states = getattr(sampler, "sampling_states", None)
-        seeds = getattr(getattr(sampling_states, "seeds", None), "gpu", None)
-        if not isinstance(seeds, torch.Tensor):
-            return None
-
-        input_batch = getattr(runner, "input_batch", None)
-        idx_mapping = getattr(input_batch, "idx_mapping", None)
-        if isinstance(idx_mapping, torch.Tensor):
-            return seeds.index_select(0, idx_mapping[:num_reqs].to(device=seeds.device, dtype=torch.long)).to(device)
-        return seeds[:num_reqs].to(device)
-
-    def _get_draft_sampling_seeds(
-        self,
-        sampling_metadata: SamplingMetadata,
-        num_reqs: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        runner_seeds = self._get_runner_sampling_state_seeds(num_reqs, device)
-        if runner_seeds is not None:
-            return runner_seeds.to(dtype=torch.int64).contiguous()
-
-        seed_buffer = getattr(self, "_dspark_sampling_seed_buffer", None)
-        if isinstance(seed_buffer, torch.Tensor) and seed_buffer.numel() >= num_reqs:
-            seeds = seed_buffer[:num_reqs]
-        else:
-            seeds = torch.empty((num_reqs,), dtype=torch.int64, device=device)
-
-        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        base_seed = int(getattr(model_config, "seed", 0) or 0)
-        for req_idx in range(num_reqs):
-            generator = sampling_metadata.generators.get(req_idx)
-            if generator is not None:
-                seeds[req_idx] = int(generator.initial_seed())
-            else:
-                seeds[req_idx] = base_seed + req_idx * 9973
-        return seeds.to(device=device, dtype=torch.int64).contiguous()
-
-    def _get_draft_idx_mapping(self, num_reqs: int, device: torch.device) -> torch.Tensor:
-        runner = getattr(self, "runner", None)
-        input_batch = getattr(runner, "input_batch", None)
-        runner_idx_mapping = getattr(input_batch, "idx_mapping", None)
-        if isinstance(runner_idx_mapping, torch.Tensor):
-            return runner_idx_mapping[:num_reqs].to(device=device, dtype=torch.int32).contiguous()
-
-        idx_mapping = getattr(self, "_dspark_idx_mapping_buffer", None)
-        if isinstance(idx_mapping, torch.Tensor) and idx_mapping.numel() >= num_reqs:
-            return idx_mapping[:num_reqs].to(device=device, dtype=torch.int32).contiguous()
-        return torch.arange(num_reqs, dtype=torch.int32, device=device)
-
-    def _sample_draft_ids(
-        self,
-        logits: torch.Tensor,
-        draft_logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        num_reqs: int,
-        step_idx: int,
-        gumbel_positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return gumbel_sample(
-            logits.contiguous(),
-            self._get_draft_idx_mapping(num_reqs, logits.device),
-            self._get_draft_sampling_temperature(sampling_metadata, num_reqs, logits.device),
-            self._get_draft_sampling_seeds(sampling_metadata, num_reqs, logits.device),
-            gumbel_positions.to(device=logits.device, dtype=torch.int32).contiguous(),
-            apply_temperature=True,
-            output_processed_logits=draft_logits,
-            output_processed_logits_col=torch.tensor(step_idx, dtype=torch.int32, device=logits.device),
-            use_fp64=getattr(self, "use_fp64_gumbel", False),
         )
 
     def _assign_request_slots(self, batch_size: int) -> list[int]:
@@ -889,120 +758,15 @@ class AscendDSparkProposer(AscendDflashProposer):
         base_logits = self.model.compute_logits(sample_hidden_states)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, block_size, vocab_size)
-        use_probabilistic = (
-            sampling_metadata is not None
-            and getattr(self, "_dspark_probabilistic", False)
-            and not sampling_metadata.all_greedy
-        )
-
-        capture_draft_logits = use_probabilistic or _dspark_accept_debug_enabled()
-        capture_components = _dspark_accept_debug_enabled()
-        draft_logits = None
-        if capture_draft_logits:
-            draft_logits = torch.empty(
-                (num_reqs, block_size, vocab_size),
-                dtype=torch.float32,
-                device=base_logits.device,
-            )
-        component_top_k = min(_dspark_accept_debug_topk(), vocab_size) if capture_components else 0
-        component_debug: dict[str, torch.Tensor] | None = None
-        if capture_components:
-            component_debug = {
-                "prev_token_ids": torch.empty((num_reqs, block_size), dtype=torch.int64, device=base_logits.device),
-                "base_logit_at_draft": torch.empty(
-                    (num_reqs, block_size), dtype=torch.float32, device=base_logits.device
-                ),
-                "markov_bias_at_draft": torch.empty(
-                    (num_reqs, block_size), dtype=torch.float32, device=base_logits.device
-                ),
-                "final_logit_at_draft": torch.empty(
-                    (num_reqs, block_size), dtype=torch.float32, device=base_logits.device
-                ),
-                "base_rank_of_draft": torch.empty((num_reqs, block_size), dtype=torch.int32, device=base_logits.device),
-                "markov_bias_rank_of_draft": torch.empty(
-                    (num_reqs, block_size), dtype=torch.int32, device=base_logits.device
-                ),
-                "final_rank_of_draft": torch.empty(
-                    (num_reqs, block_size), dtype=torch.int32, device=base_logits.device
-                ),
-            }
-            if component_top_k > 0:
-                for prefix in ("base", "markov_bias", "final"):
-                    component_debug[f"{prefix}_top_ids"] = torch.empty(
-                        (num_reqs, block_size, component_top_k),
-                        dtype=torch.int64,
-                        device=base_logits.device,
-                    )
-                    component_debug[f"{prefix}_top_values"] = torch.empty(
-                        (num_reqs, block_size, component_top_k),
-                        dtype=torch.float32,
-                        device=base_logits.device,
-                    )
-        self._dspark_last_draft_logits = None
-        self._dspark_last_draft_probs = None
-        self._dspark_last_draft_logit_components = None
 
         prev_ids = self._dspark_seed_buffer[:num_reqs]
-        gumbel_positions = None
-        if use_probabilistic:
-            # Match upstream DSpark: query row Q predicts token Q, but target
-            # verification uses the predecessor's Gumbel key.
-            gumbel_positions = self.positions[:num_sample].view(num_reqs, block_size) - 1
         for idx in range(block_size):
             markov_embed = self.model.markov_embed(prev_ids)
             markov_bias = self.model.markov_bias(markov_embed)
-            base_row = base_logits[:, idx, :]
-            logits = base_row + markov_bias
-            if use_probabilistic:
-                assert sampling_metadata is not None
-                assert draft_logits is not None
-                draft_ids = self._sample_draft_ids(
-                    logits,
-                    draft_logits,
-                    sampling_metadata,
-                    num_reqs,
-                    idx,
-                    gumbel_positions[:, idx],
-                )
-            else:
-                if draft_logits is not None:
-                    draft_logits[:, idx, :] = logits.float()
-                draft_ids = _dspark_greedy_sample(logits)
-            if component_debug is not None:
-                draft_idx = draft_ids.to(device=base_logits.device, dtype=torch.long).unsqueeze(-1)
-                component_debug["prev_token_ids"][:, idx].copy_(prev_ids)
-                component_debug["base_logit_at_draft"][:, idx].copy_(base_row.gather(1, draft_idx).squeeze(-1).float())
-                component_debug["markov_bias_at_draft"][:, idx].copy_(
-                    markov_bias.gather(1, draft_idx).squeeze(-1).float()
-                )
-                component_debug["final_logit_at_draft"][:, idx].copy_(logits.gather(1, draft_idx).squeeze(-1).float())
-                component_debug["base_rank_of_draft"][:, idx].copy_(
-                    (base_row > base_row.gather(1, draft_idx)).sum(dim=-1).to(torch.int32) + 1
-                )
-                component_debug["markov_bias_rank_of_draft"][:, idx].copy_(
-                    (markov_bias > markov_bias.gather(1, draft_idx)).sum(dim=-1).to(torch.int32) + 1
-                )
-                component_debug["final_rank_of_draft"][:, idx].copy_(
-                    (logits > logits.gather(1, draft_idx)).sum(dim=-1).to(torch.int32) + 1
-                )
-                if component_top_k > 0:
-                    for prefix, row in (
-                        ("base", base_row),
-                        ("markov_bias", markov_bias),
-                        ("final", logits),
-                    ):
-                        top_values, top_ids = torch.topk(row.float(), component_top_k, dim=-1)
-                        component_debug[f"{prefix}_top_ids"][:, idx, :].copy_(top_ids)
-                        component_debug[f"{prefix}_top_values"][:, idx, :].copy_(top_values)
+            logits = base_logits[:, idx, :] + markov_bias
+            draft_ids = _dspark_greedy_sample(logits)
             self._dspark_draft_buffer[:num_reqs, idx].copy_(draft_ids)
             prev_ids = self._dspark_draft_buffer[:num_reqs, idx]
-        if draft_logits is not None:
-            assert draft_logits is not None
-            self._dspark_last_draft_logits = draft_logits.contiguous()
-        if component_debug is not None:
-            self._dspark_last_draft_logit_components = {
-                name: value.contiguous() for name, value in component_debug.items()
-            }
         return self._dspark_draft_buffer[:num_reqs, :block_size]
 
     def _propose(
@@ -1114,16 +878,4 @@ class AscendDSparkProposer(AscendDflashProposer):
                 token_indices_to_sample,
                 sampling_metadata,
             )
-            if _dspark_reject_debug_enabled():
-                print(
-                    "[dspark-propose-debug] "
-                    f"num_tokens={num_tokens} "
-                    f"num_context={num_context} "
-                    f"{_debug_tensor_head('input_ids', self.input_ids[:num_tokens])} "
-                    f"{_debug_tensor_head('positions', self.positions[:num_tokens])} "
-                    f"{_debug_tensor_head('target_positions', target_positions)} "
-                    f"{_debug_tensor_head('next_token_ids', next_token_ids)} "
-                    f"{_debug_tensor_head('draft_token_ids', draft_token_ids)}",
-                    flush=True,
-                )
         return draft_token_ids
