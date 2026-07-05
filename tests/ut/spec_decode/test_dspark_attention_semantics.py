@@ -1,22 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-import vllm_ascend.ops.dspark_attention as dspark_attention_module
-from vllm_ascend.models.deepseek_v4_dspark import (
-    _dspark_cache_capacity,
-)
 from vllm_ascend.ops.dspark_attention import (
     _dspark_sas_lens_match_scheduling,
     _dspark_sas_window,
     _dspark_sparse_sas_window,
-    _gather_context_kv,
-    _validate_query_block_slots,
     build_dspark_swa_indices,
-    dspark_attention,
     dspark_attention_from_standard_cache,
 )
 
@@ -390,330 +381,6 @@ def test_dspark_swa_indices_use_explicit_metadata_not_block_offsets():
     torch.testing.assert_close(indices[5, 0, :5], expected_req2)
 
 
-def test_dspark_attention_entry_uses_custom_op_gateway(monkeypatch):
-    q = torch.zeros(2, 1, 4, dtype=torch.float32)
-    expected = torch.full_like(q, 7.0)
-
-    def fake_custom_op(*args):
-        assert args[0] is q
-        assert args[-3:] == (2, 3, 0.125)
-        return expected
-
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_attention_custom_op",
-        lambda _q: fake_custom_op,
-    )
-    actual = dspark_attention(
-        q,
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, dtype=torch.int32),
-        torch.empty(1, 4, dtype=torch.bool),
-        torch.empty(2, 1, 4),
-        torch.empty(2, 1, 4),
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([3, 4], dtype=torch.int32),
-        torch.zeros(1),
-        2,
-        3,
-        0.125,
-    )
-
-    assert actual is expected
-
-
-def test_dspark_attention_entry_uses_sas_gateway(monkeypatch):
-    q = torch.ones(2, 4, 4, dtype=torch.float32)
-    draft_k = torch.arange(2 * 4 * 4, dtype=torch.float32).view(2, 4, 4)
-    block_size = 2
-    window_size = 3
-    calls = []
-
-    def fake_metadata_op(**kwargs):
-        assert kwargs["num_heads_q"] == 4
-        assert kwargs["num_heads_kv"] == 1
-        assert kwargs["ori_win_left"] == window_size + block_size - 1
-        assert kwargs["ori_win_right"] == block_size - 1
-        assert kwargs["layout_q"] == "TND"
-        assert kwargs["layout_kv"] == "TND"
-        assert kwargs["has_cmp_kv"] is False
-        return torch.empty(1024, dtype=torch.int32)
-
-    def fake_attn_op(q_block, **kwargs):
-        assert kwargs["ori_kv"].shape == (2, 1, 4)
-        assert kwargs["sinks"].dtype == torch.float32
-        assert kwargs["sinks"].shape == (4,)
-        assert kwargs["ori_win_left"] == window_size + block_size - 1
-        assert kwargs["ori_win_right"] == block_size - 1
-        calls.append(kwargs)
-        return q_block + 2, torch.empty(0)
-
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_attention_custom_op",
-        lambda _q: None,
-    )
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_sas_ops",
-        lambda _q: (fake_metadata_op, fake_attn_op),
-    )
-
-    actual = dspark_attention(
-        q,
-        torch.empty(1, 4, 4, 4),
-        torch.empty(1, 4, 4, 4),
-        torch.empty(1, 4, dtype=torch.int32),
-        torch.empty(1, 4, dtype=torch.bool),
-        draft_k,
-        draft_k,
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.zeros(4, dtype=torch.bfloat16),
-        block_size,
-        window_size,
-        0.125,
-        shared_kv=True,
-    )
-
-    assert len(calls) == 1
-    torch.testing.assert_close(actual, q + 2)
-
-
-def test_dspark_attention_entry_does_not_use_sas_without_shared_kv(monkeypatch):
-    q = torch.ones(2, 1, 4, dtype=torch.float32)
-    draft_k = torch.ones(2, 1, 4, dtype=torch.float32)
-    draft_v = draft_k + 1
-
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_attention_custom_op",
-        lambda _q: None,
-    )
-
-    def fail_if_sas_is_used(_q):
-        raise AssertionError("SAS gateway must be gated by shared_kv=True")
-
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_sas_ops",
-        fail_if_sas_is_used,
-    )
-
-    actual = dspark_attention(
-        q,
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, dtype=torch.int32),
-        torch.empty(1, 4, dtype=torch.bool),
-        draft_k,
-        draft_v,
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.zeros(1),
-        2,
-        3,
-        0.125,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        _dspark_attention_reference(q, draft_k, draft_v, torch.zeros(1), 0.125),
-    )
-
-
-def test_dspark_attention_warns_when_sas_falls_back(monkeypatch):
-    q = torch.ones(2, 1, 4, dtype=torch.float32)
-    draft_k = torch.ones(2, 1, 4, dtype=torch.float32)
-    warnings = []
-
-    def fake_metadata_op(**kwargs):
-        return torch.empty(1, dtype=torch.int32)
-
-    def fake_attn_op(*args, **kwargs):
-        raise RuntimeError("synthetic sas failure")
-
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_attention_custom_op",
-        lambda _q: None,
-    )
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_sas_ops",
-        lambda _q: (fake_metadata_op, fake_attn_op),
-    )
-    monkeypatch.setattr(
-        dspark_attention_module.logger,
-        "warning_once",
-        lambda *args, **kwargs: warnings.append(args),
-    )
-
-    actual = dspark_attention(
-        q,
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, dtype=torch.int32),
-        torch.empty(1, 4, dtype=torch.bool),
-        draft_k,
-        draft_k,
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.zeros(1),
-        2,
-        3,
-        0.125,
-        shared_kv=True,
-    )
-
-    assert warnings
-    assert "DSpark SAS attention failed" in warnings[0][0]
-    torch.testing.assert_close(
-        actual,
-        _dspark_attention_reference(q, draft_k, draft_k, torch.zeros(1), 0.125),
-    )
-
-
-def test_dspark_attention_shared_kv_fallback_uses_k_as_v(monkeypatch):
-    q = torch.ones(2, 1, 4, dtype=torch.float32)
-    draft_k = torch.ones(2, 1, 4, dtype=torch.float32)
-    draft_v = torch.full_like(draft_k, 100.0)
-
-    def fake_metadata_op(**kwargs):
-        return torch.empty(1, dtype=torch.int32)
-
-    def fake_attn_op(*args, **kwargs):
-        raise RuntimeError("synthetic sas failure")
-
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_attention_custom_op",
-        lambda _q: None,
-    )
-    monkeypatch.setattr(
-        dspark_attention_module,
-        "_get_dspark_sas_ops",
-        lambda _q: (fake_metadata_op, fake_attn_op),
-    )
-
-    actual = dspark_attention(
-        q,
-        torch.empty(1, 4, 1, 4),
-        torch.empty(1, 4, 1, 4).fill_(100.0),
-        torch.empty(1, 4, dtype=torch.int32),
-        torch.empty(1, 4, dtype=torch.bool),
-        draft_k,
-        draft_v,
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.zeros(1),
-        2,
-        3,
-        0.125,
-        shared_kv=True,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        _dspark_attention_reference(q, draft_k, draft_k, torch.zeros(1), 0.125),
-    )
-
-
-def test_dspark_attention_is_noncausal_within_draft_block():
-    ctx_len = 2
-    block = 4
-    heads = 1
-    dim = 4
-    scale = 1.0
-
-    q = torch.ones(block, heads, dim, dtype=torch.float32)
-    k_ctx = torch.zeros(ctx_len + block, heads, dim, dtype=torch.float32)
-    v_ctx = torch.zeros(ctx_len + block, heads, dim, dtype=torch.float32)
-
-    # The last draft token is a future token for the first query. Make it
-    # dominate softmax if the implementation truly attends non-causally.
-    k_ctx[-1].fill_(4.0)
-    v_ctx[-1].fill_(10.0)
-    attn_sink = torch.full((heads,), -100.0, dtype=torch.float32)
-
-    noncausal = _dspark_attention_loop(q, k_ctx, v_ctx, attn_sink, scale)
-    causal_first = _dspark_attention_reference(
-        q[:1],
-        k_ctx[: ctx_len + 1],
-        v_ctx[: ctx_len + 1],
-        attn_sink,
-        scale,
-    )
-
-    assert noncausal[0].mean().item() > 9.0
-    assert causal_first[0].mean().item() == 0.0
-    assert (noncausal[0] - causal_first[0]).abs().max().item() > 9.0
-
-
-def test_dspark_attention_entry_matches_reference_with_request_cache():
-    torch.manual_seed(1)
-    block_size = 2
-    window_size = 3
-    heads = 2
-    dim = 4
-    q = torch.randn(4, heads, dim, dtype=torch.float32)
-    draft_k = torch.randn(4, heads, dim, dtype=torch.float32)
-    draft_v = torch.randn(4, heads, dim, dtype=torch.float32)
-    positions = torch.tensor([5, 6, 9, 10], dtype=torch.int32)
-    request_slots = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
-    attn_sink = torch.tensor([0.25, -0.5], dtype=torch.float32)
-    scale = 0.125
-
-    cache_k = torch.zeros(2, 8, heads, dim, dtype=torch.float32)
-    cache_v = torch.zeros(2, 8, heads, dim, dtype=torch.float32)
-    cache_positions = torch.full((2, 8), -1, dtype=torch.int32)
-    cache_valid = torch.zeros(2, 8, dtype=torch.bool)
-
-    for slot, ctx_positions in [(0, torch.tensor([3, 4, 5])), (1, torch.tensor([7, 8, 9]))]:
-        values = torch.randn(ctx_positions.numel(), heads, dim, dtype=torch.float32)
-        indices = ctx_positions % cache_k.shape[1]
-        cache_k[slot, indices] = values
-        cache_v[slot, indices] = values + (slot + 1)
-        cache_positions[slot, indices] = ctx_positions.to(torch.int32)
-        cache_valid[slot, indices] = True
-
-    actual = dspark_attention(
-        q,
-        cache_k,
-        cache_v,
-        cache_positions,
-        cache_valid,
-        draft_k,
-        draft_v,
-        request_slots,
-        positions,
-        attn_sink,
-        block_size,
-        window_size,
-        scale,
-    )
-
-    expected_blocks = []
-    for block_offset, slot, ctx_start, ctx_end in [(0, 0, 3, 4), (2, 1, 7, 8)]:
-        ctx_positions = torch.arange(ctx_start, ctx_end + 1)
-        ctx_indices = ctx_positions % cache_k.shape[1]
-        k_ctx = torch.cat([cache_k[slot, ctx_indices], draft_k[block_offset : block_offset + block_size]], dim=0)
-        v_ctx = torch.cat([cache_v[slot, ctx_indices], draft_v[block_offset : block_offset + block_size]], dim=0)
-        expected_blocks.append(
-            _dspark_attention_reference(
-                q[block_offset : block_offset + block_size],
-                k_ctx,
-                v_ctx,
-                attn_sink,
-                scale,
-            )
-        )
-    expected = torch.cat(expected_blocks, dim=0)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
-
-
 def test_dspark_attention_from_standard_cache_matches_paged_swa_reference():
     torch.manual_seed(2)
     block_size = 3
@@ -750,7 +417,6 @@ def test_dspark_attention_from_standard_cache_matches_paged_swa_reference():
         block_table,
         positions,
         slot_mapping=torch.arange(6, dtype=torch.int32),
-        draft_kv=None,
         attn_sink=attn_sink,
         block_size=block_size,
         window_size=window_size,
@@ -800,7 +466,6 @@ def test_dspark_attention_from_standard_cache_reads_current_draft_kv_from_cache(
     current_draft_kv = torch.randn(block_size, 1, dim, dtype=torch.float32)
     for pos in range(10, 13):
         cache[block_table[0, pos // cache_block_size], pos % cache_block_size, 0] = current_draft_kv[pos - 10]
-    ignored_draft_kv = torch.full((block_size, 1, dim), 1000.0, dtype=torch.float32)
     attn_sink = torch.tensor([0.1, -0.2], dtype=torch.float32)
 
     actual = dspark_attention_from_standard_cache(
@@ -809,7 +474,6 @@ def test_dspark_attention_from_standard_cache_reads_current_draft_kv_from_cache(
         block_table,
         positions,
         slot_mapping=torch.arange(block_size, dtype=torch.int32),
-        draft_kv=ignored_draft_kv,
         attn_sink=attn_sink,
         block_size=block_size,
         window_size=window_size,
@@ -847,12 +511,6 @@ def test_dspark_attention_from_standard_cache_ignores_private_cache_validity():
     for pos in range(6, 13):
         cache[block_table[0, pos // cache_block_size], pos % cache_block_size, 0] = torch.randn(dim)
     cache[block_table[0, 8 // cache_block_size], 8 % cache_block_size, 0] = 1000.0
-    ignored_draft_kv = torch.full((block_size, 1, dim), -1000.0, dtype=torch.float32)
-    cache_positions = torch.full((1, 16), -1, dtype=torch.int32)
-    cache_valid = torch.zeros((1, 16), dtype=torch.bool)
-    valid_context_positions = torch.tensor([6, 7, 9], dtype=torch.long)
-    cache_positions[0, valid_context_positions] = valid_context_positions.to(torch.int32)
-    cache_valid[0, valid_context_positions] = True
     attn_sink = torch.tensor([0.1, -0.2], dtype=torch.float32)
 
     actual = dspark_attention_from_standard_cache(
@@ -861,15 +519,11 @@ def test_dspark_attention_from_standard_cache_ignores_private_cache_validity():
         block_table,
         positions,
         slot_mapping=torch.arange(block_size, dtype=torch.int32),
-        draft_kv=ignored_draft_kv,
         attn_sink=attn_sink,
         block_size=block_size,
         window_size=window_size,
         cache_block_size=cache_block_size,
         softmax_scale=scale,
-        request_slots=torch.zeros(block_size, dtype=torch.int32),
-        cache_positions=cache_positions,
-        cache_valid=cache_valid,
     )
 
     context_kv = torch.stack(
@@ -914,7 +568,6 @@ def test_dspark_attention_from_standard_cache_zeros_padded_rows_with_2d_slots():
         block_table,
         positions,
         slot_mapping=slot_mapping,
-        draft_kv=None,
         attn_sink=torch.zeros(heads, dtype=torch.float32),
         block_size=block_size,
         window_size=4,
@@ -950,7 +603,6 @@ def test_dspark_attention_from_standard_cache_uses_query_start_loc_ranges():
         block_table,
         positions,
         slot_mapping=slot_mapping,
-        draft_kv=None,
         attn_sink=attn_sink,
         block_size=block_size,
         window_size=window_size,
@@ -1006,7 +658,6 @@ def test_dspark_attention_from_standard_cache_uses_token_to_req_indices():
         block_table,
         positions,
         slot_mapping=slot_mapping,
-        draft_kv=None,
         attn_sink=attn_sink,
         block_size=block_size,
         window_size=window_size,
@@ -1052,56 +703,9 @@ def test_dspark_attention_from_standard_cache_rejects_unsupported_cache_layout()
             torch.tensor([[0]], dtype=torch.int32),
             torch.tensor([0], dtype=torch.int32),
             slot_mapping=None,
-            draft_kv=None,
             attn_sink=torch.zeros(1, dtype=torch.float32),
             block_size=1,
             window_size=1,
             cache_block_size=4,
             softmax_scale=1.0,
         )
-
-
-def test_dspark_attention_cache_capacity_includes_draft_block():
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096))
-
-    assert _dspark_cache_capacity(vllm_config, block_size=5) == 4101
-    assert _dspark_cache_capacity(vllm_config, block_size=5, window_size=128) == 133
-    assert _dspark_cache_capacity(SimpleNamespace(model_config=None), block_size=5) == 5
-
-
-def test_dspark_context_cache_is_request_local_and_rolling():
-    cache_k = torch.zeros(2, 4, 1, 1, dtype=torch.float32)
-    cache_v = torch.zeros(2, 4, 1, 1, dtype=torch.float32)
-    cache_positions = torch.full((2, 4), -1, dtype=torch.int32)
-    cache_valid = torch.zeros(2, 4, dtype=torch.bool)
-
-    # Both requests write the same absolute positions. They alias on rolling
-    # indices, but must stay isolated by request slot.
-    for slot, value in [(0, 10.0), (1, 20.0)]:
-        positions = torch.tensor([4, 5], dtype=torch.long)
-        indices = positions % cache_k.shape[1]
-        cache_k[slot, indices] = value
-        cache_v[slot, indices] = value + 1
-        cache_positions[slot, indices] = positions.to(torch.int32)
-        cache_valid[slot, indices] = True
-
-    k0, v0 = _gather_context_kv(cache_k, cache_v, cache_positions, cache_valid, 0, 4, 5)
-    k1, v1 = _gather_context_kv(cache_k, cache_v, cache_positions, cache_valid, 1, 4, 5)
-
-    torch.testing.assert_close(k0.flatten(), torch.tensor([10.0, 10.0]))
-    torch.testing.assert_close(v0.flatten(), torch.tensor([11.0, 11.0]))
-    torch.testing.assert_close(k1.flatten(), torch.tensor([20.0, 20.0]))
-    torch.testing.assert_close(v1.flatten(), torch.tensor([21.0, 21.0]))
-
-    # Position 0 shares rolling index with position 4, but the stored absolute
-    # position prevents stale context from being reused.
-    k_stale, v_stale = _gather_context_kv(cache_k, cache_v, cache_positions, cache_valid, 0, 0, 1)
-    assert k_stale.numel() == 0
-    assert v_stale.numel() == 0
-
-
-def test_dspark_query_block_slots_must_not_mix_requests():
-    _validate_query_block_slots(torch.tensor([0, 0, 1, 1], dtype=torch.int32), block_size=2)
-
-    with pytest.raises(ValueError, match="constant within each draft block"):
-        _validate_query_block_slots(torch.tensor([0, 1, 1, 1], dtype=torch.int32), block_size=2)

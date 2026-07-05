@@ -17,7 +17,6 @@ from vllm_ascend.models.deepseek_v4_dspark import (
     DeepSeekV4DSparkMTP,
     _get_dspark_num_mtp_layers,
     _maybe_fp8_e4m3fn_qdq,
-    _maybe_fp8_qdq_nope_dims,
     _should_apply_dspark_fp8_qdq,
 )
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
@@ -62,10 +61,8 @@ def test_dspark_fp8_qdq_is_disabled_for_bf16_dequantized_checkpoints():
 
 
 def test_dspark_fp8_qdq_helpers_return_input_when_disabled():
-    kv = torch.randn(2, 128)
     out = torch.randn(2, 2, 128)
 
-    assert _maybe_fp8_qdq_nope_dims(kv, nope_head_dim=64, apply_fp8_qdq=False) is kv
     assert _maybe_fp8_e4m3fn_qdq(out, apply_fp8_qdq=False, block_size=128) is out
 
 
@@ -103,7 +100,6 @@ def test_dspark_attention_uses_upstream_no_compression_ratio(monkeypatch):
         self.head_dim = 4
 
     monkeypatch.setattr(dspark_model_module.DeepseekV4Attention, "__init__", fake_base_init)
-    monkeypatch.setattr(dspark_model_module, "current_platform", SimpleNamespace(device_type="cpu"))
 
     attn = DeepseekV4DSparkAttention(
         vllm_config=SimpleNamespace(
@@ -329,15 +325,14 @@ def test_dspark_precompute_context_kv_passes_layer_slot_mappings(monkeypatch):
     calls = []
 
     def make_layer(name: str) -> SimpleNamespace:
-        def precompute_context_kv(main_x, positions, request_slots=None, context_slot_mapping=None):
-            calls.append((name, main_x, positions, request_slots, context_slot_mapping))
+        def precompute_context_kv(main_x, positions, context_slot_mapping=None):
+            calls.append((name, main_x, positions, context_slot_mapping))
 
         return SimpleNamespace(self_attn=SimpleNamespace(precompute_context_kv=precompute_context_kv))
 
     monkeypatch.setattr(dspark_model_module, "_linear_output", lambda _proj, hidden_states: hidden_states + 1)
     context_states = torch.arange(6, dtype=torch.float32).view(3, 2)
     positions = torch.tensor([4, 5, 6], dtype=torch.int32)
-    request_slots = torch.tensor([1, 1, 1], dtype=torch.int32)
     layer_slot_mappings = [
         torch.tensor([10, 11, 12], dtype=torch.int32),
         torch.tensor([20, 21, 22], dtype=torch.int32),
@@ -356,15 +351,13 @@ def test_dspark_precompute_context_kv_passes_layer_slot_mappings(monkeypatch):
         context_states,
         positions,
         context_slot_mapping=layer_slot_mappings,
-        context_request_slots=request_slots,
     )
 
     assert [call[0] for call in calls] == ["61", "62"]
     for idx, call in enumerate(calls):
-        _, main_x, call_positions, call_request_slots, call_slot_mapping = call
+        _, main_x, call_positions, call_slot_mapping = call
         torch.testing.assert_close(main_x, (context_states + 1) * 2)
         assert call_positions is positions
-        assert call_request_slots is request_slots
         assert call_slot_mapping is layer_slot_mappings[idx]
 
 
@@ -372,8 +365,8 @@ def test_dspark_precompute_context_kv_selects_prefix_mapped_slot_mappings(monkey
     calls = []
 
     def make_layer(name: str, prefix: str) -> SimpleNamespace:
-        def precompute_context_kv(main_x, positions, request_slots=None, context_slot_mapping=None):
-            calls.append((name, main_x, positions, request_slots, context_slot_mapping))
+        def precompute_context_kv(main_x, positions, context_slot_mapping=None):
+            calls.append((name, main_x, positions, context_slot_mapping))
 
         return SimpleNamespace(
             self_attn=SimpleNamespace(
@@ -387,7 +380,6 @@ def test_dspark_precompute_context_kv_selects_prefix_mapped_slot_mappings(monkey
     monkeypatch.setattr(dspark_model_module, "_linear_output", lambda _proj, hidden_states: hidden_states + 1)
     context_states = torch.arange(6, dtype=torch.float32).view(3, 2)
     positions = torch.tensor([4, 5, 6], dtype=torch.int32)
-    request_slots = torch.tensor([1, 1, 1], dtype=torch.int32)
     slot_mapping_61 = torch.tensor([10, 11, 12], dtype=torch.int32)
     slot_mapping_62 = torch.tensor([20, 21, 22], dtype=torch.int32)
     model = SimpleNamespace(
@@ -407,11 +399,10 @@ def test_dspark_precompute_context_kv_selects_prefix_mapped_slot_mappings(monkey
             "model.layers.61.self_attn.swa_cache": slot_mapping_61,
             "model.layers.62.self_attn.swa_cache": slot_mapping_62,
         },
-        context_request_slots=request_slots,
     )
 
-    assert calls[0][4] is slot_mapping_61
-    assert calls[1][4] is slot_mapping_62
+    assert calls[0][3] is slot_mapping_61
+    assert calls[1][3] is slot_mapping_62
 
 
 def test_dspark_forward_passes_query_slot_mapping_to_layers():
@@ -427,18 +418,16 @@ def test_dspark_forward_passes_query_slot_mapping_to_layers():
             post_mix=None,
             res_mix=None,
             input_ids,
-            request_slots=None,
             slot_mapping=None,
             block_table=None,
         ):
             del residual, post_mix, res_mix
-            calls.append((positions, hidden_states, input_ids, request_slots, slot_mapping, block_table))
+            calls.append((positions, hidden_states, input_ids, slot_mapping, block_table))
             return hidden_states + 1
 
     input_ids = torch.tensor([1, 2], dtype=torch.int64)
     positions = torch.tensor([10, 11], dtype=torch.int32)
     inputs_embeds = torch.ones(2, 3)
-    request_slots = torch.tensor([4, 4], dtype=torch.int32)
     slot_mapping = torch.tensor([80, 81], dtype=torch.int32)
     model = SimpleNamespace(
         embed_tokens=None,
@@ -455,16 +444,14 @@ def test_dspark_forward_passes_query_slot_mapping_to_layers():
         input_ids=input_ids,
         positions=positions,
         inputs_embeds=inputs_embeds,
-        request_slots=request_slots,
         slot_mapping=slot_mapping,
     )
 
     assert len(calls) == 2
     for call in calls:
-        call_positions, _, call_input_ids, call_request_slots, call_slot_mapping, call_block_table = call
+        call_positions, _, call_input_ids, call_slot_mapping, call_block_table = call
         assert call_positions is positions
         assert call_input_ids is input_ids
-        assert call_request_slots is request_slots
         assert call_slot_mapping is slot_mapping
         assert call_block_table is None
     torch.testing.assert_close(output, inputs_embeds.unsqueeze(-2).repeat(1, 2, 1) + 2)
@@ -597,7 +584,6 @@ def test_dspark_decoder_layer_uses_upstream_style_mhc_state_flow():
 
 
 def test_dspark_attention_rebuilds_standard_query_slot_mapping(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     attn = object.__new__(DeepseekV4DSparkAttention)
     attn.block_size = 5
@@ -622,7 +608,6 @@ def test_dspark_attention_rebuilds_standard_query_slot_mapping(monkeypatch):
 
 
 def test_dspark_attention_rebuilds_standard_query_slot_mapping_with_token_to_req(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     attn = object.__new__(DeepseekV4DSparkAttention)
     attn.block_size = 2
@@ -674,18 +659,16 @@ def test_dspark_forward_selects_prefix_mapped_slot_mapping_and_block_table():
             post_mix=None,
             res_mix=None,
             input_ids,
-            request_slots=None,
             slot_mapping=None,
             block_table=None,
         ):
             del residual, post_mix, res_mix
-            calls.append((positions, hidden_states, input_ids, request_slots, slot_mapping, block_table))
+            calls.append((positions, hidden_states, input_ids, slot_mapping, block_table))
             return hidden_states + 1
 
     input_ids = torch.tensor([1, 2], dtype=torch.int64)
     positions = torch.tensor([10, 11], dtype=torch.int32)
     inputs_embeds = torch.ones(2, 3)
-    request_slots = torch.tensor([4, 4], dtype=torch.int32)
     slot_mapping_61 = torch.tensor([80, 81], dtype=torch.int32)
     slot_mapping_62 = torch.tensor([180, 181], dtype=torch.int32)
     block_table_61 = torch.tensor([[1, 2]], dtype=torch.int32)
@@ -705,7 +688,6 @@ def test_dspark_forward_selects_prefix_mapped_slot_mapping_and_block_table():
         input_ids=input_ids,
         positions=positions,
         inputs_embeds=inputs_embeds,
-        request_slots=request_slots,
         slot_mapping={
             "model.layers.61.self_attn.swa_cache": slot_mapping_61,
             "model.layers.62.self_attn.swa_cache": slot_mapping_62,
@@ -717,17 +699,16 @@ def test_dspark_forward_selects_prefix_mapped_slot_mapping_and_block_table():
     )
 
     assert len(calls) == 2
-    assert calls[0][4] is slot_mapping_61
-    assert calls[0][5] is block_table_61
-    assert calls[1][4] is slot_mapping_62
-    assert calls[1][5] is block_table_62
+    assert calls[0][3] is slot_mapping_61
+    assert calls[0][4] is block_table_61
+    assert calls[1][3] is slot_mapping_62
+    assert calls[1][4] is block_table_62
     torch.testing.assert_close(output, inputs_embeds.unsqueeze(-2).repeat(1, 2, 1) + 2)
 
 
 def test_dspark_store_standard_swa_kv_uses_dsa_slot_mapping(monkeypatch):
     from vllm_ascend.device import device_op as device_op_module
 
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
     calls = []
 
     def fake_format(slot_mapping, block_size):
@@ -763,7 +744,6 @@ def test_dspark_store_standard_swa_kv_uses_dsa_slot_mapping(monkeypatch):
 
 
 def test_dspark_standard_attention_can_fallback_to_pta(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
     monkeypatch.setenv("VLLM_ASCEND_DSPARK_USE_PTA_REF", "1")
 
     expected = torch.ones(2, 4, 8)
@@ -807,7 +787,6 @@ def test_dspark_standard_attention_can_fallback_to_pta(monkeypatch):
 
 
 def test_dspark_standard_attention_uses_sas_by_default(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
     monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PTA_REF", raising=False)
 
     expected = torch.ones(2, 4, 8)

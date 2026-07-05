@@ -131,119 +131,7 @@ def test_dspark_sample_sequential_reduce_sample_uses_tp_greedy(monkeypatch):
     torch.testing.assert_close(draft_tokens, torch.tensor([[3]], dtype=torch.int64))
 
 
-def test_dspark_set_inputs_first_pass_uses_anchor_first_block(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", "1")
-    device = torch.device("cpu")
-    block_size = 3
-    batch_size = 2
-    proposer = SimpleNamespace(
-        device=device,
-        num_speculative_tokens=block_size,
-        parallel_drafting_token_id=99,
-        kernel_block_size=8,
-        token_arange_np=np.arange(16, dtype=np.int32),
-        arange_dspark=torch.arange(32, dtype=torch.int32),
-        input_ids=torch.zeros(batch_size * block_size, dtype=torch.int64),
-        positions=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _slot_mapping_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _dspark_seed_buffer=torch.full((4,), -1, dtype=torch.int64),
-        _dflash_hidden_states=torch.zeros(8, 2, dtype=torch.float32),
-        _context_positions_buffer=torch.zeros(8, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(8, dtype=torch.int32),
-        _context_slot_mapping_buffer=torch.zeros(8, dtype=torch.int32),
-    )
-    proposer._assign_request_slots = lambda size: [4, 5]
-    proposer._get_draft_block_table = AscendDSparkProposer._get_draft_block_table.__get__(proposer)
-    proposer._slot_mapping_from_block_table = AscendDSparkProposer._slot_mapping_from_block_table.__get__(proposer)
-
-    target_positions = torch.tensor([5, 6, 7, 15, 16, 17], dtype=torch.int32)
-    target_hidden_states = torch.arange(12, dtype=torch.float32).view(6, 2)
-    next_token_ids = torch.tensor([101, 202], dtype=torch.int64)
-    cad = AscendCommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, 3, 6], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
-        seq_lens=torch.tensor([8, 18], dtype=torch.int32),
-        _seq_lens_cpu=torch.tensor([8, 18], dtype=torch.int32),
-        seq_lens_cpu=None,
-        num_computed_tokens_cpu=None,
-        num_reqs=batch_size,
-        num_actual_tokens=6,
-        num_input_tokens=6,
-        max_query_len=3,
-        actual_seq_lengths_q=[3, 3],
-        block_table_tensor=torch.tensor(
-            [
-                [10, 20, 30],
-                [11, 21, 31],
-            ],
-            dtype=torch.int32,
-        ),
-        slot_mapping=torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.int32),
-        positions=target_positions,
-        attn_state=AscendAttentionState.SpecDecoding,
-        decode_token_per_req=1,
-        max_seq_len=18,
-    )
-
-    num_query_total, token_indices, returned_cad, maybe_graph_input = AscendDSparkProposer.set_inputs_first_pass(
-        proposer,
-        target_token_ids=torch.arange(6, dtype=torch.int64),
-        next_token_ids=next_token_ids,
-        target_positions=target_positions,
-        target_hidden_states=target_hidden_states,
-        token_indices_to_sample=None,
-        cad=cad,
-        num_rejected_tokens_gpu=None,
-    )
-
-    assert returned_cad is cad
-    assert maybe_graph_input is None
-    assert num_query_total == batch_size * block_size
-    torch.testing.assert_close(token_indices, torch.arange(6, dtype=torch.int32))
-    torch.testing.assert_close(proposer._dspark_seed_buffer[:4], torch.tensor([101, 202, 0, 0]))
-    torch.testing.assert_close(
-        proposer.input_ids,
-        torch.tensor([101, 99, 99, 202, 99, 99], dtype=torch.int64),
-    )
-    torch.testing.assert_close(
-        proposer.positions,
-        torch.tensor([8, 9, 10, 18, 19, 20], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        proposer._request_slots_buffer,
-        torch.tensor([4, 4, 4, 5, 5, 5], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        cad.slot_mapping,
-        torch.tensor([160, 161, 162, 250, 251, 252], dtype=torch.int32),
-    )
-    torch.testing.assert_close(cad.query_start_loc, torch.tensor([0, 3, 6], dtype=torch.int32))
-    torch.testing.assert_close(cad.query_start_loc_cpu, torch.tensor([0, 3, 6], dtype=torch.int32))
-    torch.testing.assert_close(cad.seq_lens, torch.tensor([11, 21], dtype=torch.int32))
-    assert cad.max_query_len == block_size
-    assert cad.max_seq_len == 21
-    assert cad.num_actual_tokens == 6
-    assert cad.causal is False
-    assert cad.attn_mask is None
-    assert cad.attn_state == AscendAttentionState.ChunkedPrefill
-    assert cad.decode_token_per_req == block_size
-    assert cad.actual_seq_lengths_q == [block_size, block_size]
-    torch.testing.assert_close(proposer._dflash_hidden_states[:6], target_hidden_states)
-    torch.testing.assert_close(proposer._context_positions_buffer[:6], target_positions)
-    torch.testing.assert_close(
-        proposer._context_request_slots_buffer[:6],
-        torch.tensor([4, 4, 4, 5, 5, 5], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        proposer._context_slot_mapping_buffer[:6],
-        torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.int32),
-    )
-    assert proposer._dflash_num_context == 6
-
-
 def test_dspark_standard_dsa_uses_draft_group_block_table(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     class FakeBlockTable:
         def __init__(self, table):
@@ -290,11 +178,9 @@ def test_dspark_standard_dsa_uses_draft_group_block_table(monkeypatch):
         input_ids=torch.zeros(batch_size * block_size, dtype=torch.int64),
         positions=torch.zeros(batch_size * block_size, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
         _dspark_seed_buffer=torch.full((4,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(8, 2, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(8, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(8, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(8, dtype=torch.int32),
         draft_attn_groups=[
             AttentionGroup(
@@ -306,8 +192,6 @@ def test_dspark_standard_dsa_uses_draft_group_block_table(monkeypatch):
             )
         ],
     )
-    proposer._assign_request_slots = lambda size: [4, 5]
-    proposer._get_draft_block_table = AscendDSparkProposer._get_draft_block_table.__get__(proposer)
     proposer._get_draft_block_table_for_gid = AscendDSparkProposer._get_draft_block_table_for_gid.__get__(proposer)
     proposer._get_draft_block_tables = AscendDSparkProposer._get_draft_block_tables.__get__(proposer)
     proposer._layer_map_from_gid_map = AscendDSparkProposer._layer_map_from_gid_map.__get__(proposer)
@@ -346,7 +230,7 @@ def test_dspark_standard_dsa_uses_draft_group_block_table(monkeypatch):
         num_rejected_tokens_gpu=None,
     )
 
-    torch.testing.assert_close(proposer._dspark_block_table, draft_block_table)
+    torch.testing.assert_close(proposer._dspark_block_tables_by_gid[1], draft_block_table)
     torch.testing.assert_close(
         proposer._context_slot_mapping_buffer[:6],
         torch.tensor([245, 246, 247, 335, 408, 409], dtype=torch.int32),
@@ -355,11 +239,10 @@ def test_dspark_standard_dsa_uses_draft_group_block_table(monkeypatch):
         cad.slot_mapping,
         torch.tensor([320, 321, 322, 410, 411, 412], dtype=torch.int32),
     )
-    assert proposer._dspark_block_tables_by_layer["draft.swa"] is proposer._dspark_block_table
+    assert proposer._dspark_block_tables_by_layer["draft.swa"] is proposer._dspark_block_tables_by_gid[1]
 
 
 def test_dspark_standard_dsa_keeps_compact_block_table_order(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     class FakeBlockTable:
         def __init__(self, table):
@@ -408,11 +291,9 @@ def test_dspark_standard_dsa_keeps_compact_block_table_order(monkeypatch):
         input_ids=torch.zeros(block_size, dtype=torch.int64),
         positions=torch.zeros(block_size, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(block_size, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(block_size, dtype=torch.int32),
         _dspark_seed_buffer=torch.full((2,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(4, 2, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(4, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(4, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(4, dtype=torch.int32),
         draft_attn_groups=[
             AttentionGroup(
@@ -424,8 +305,6 @@ def test_dspark_standard_dsa_keeps_compact_block_table_order(monkeypatch):
             )
         ],
     )
-    proposer._assign_request_slots = lambda size: [4]
-    proposer._get_draft_block_table = AscendDSparkProposer._get_draft_block_table.__get__(proposer)
     proposer._get_draft_block_table_for_gid = AscendDSparkProposer._get_draft_block_table_for_gid.__get__(proposer)
     proposer._get_draft_block_tables = AscendDSparkProposer._get_draft_block_tables.__get__(proposer)
     proposer._layer_map_from_gid_map = AscendDSparkProposer._layer_map_from_gid_map.__get__(proposer)
@@ -464,7 +343,7 @@ def test_dspark_standard_dsa_keeps_compact_block_table_order(monkeypatch):
         num_rejected_tokens_gpu=None,
     )
 
-    torch.testing.assert_close(proposer._dspark_block_table, draft_block_table[:1])
+    torch.testing.assert_close(proposer._dspark_block_tables_by_gid[1], draft_block_table[:1])
     torch.testing.assert_close(
         proposer._context_slot_mapping_buffer[:2],
         torch.tensor([13, 14], dtype=torch.int32),
@@ -473,7 +352,6 @@ def test_dspark_standard_dsa_keeps_compact_block_table_order(monkeypatch):
 
 
 def test_dspark_standard_dsa_prefers_runner_per_group_metadata(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     class FakeBlockTable:
         def __init__(self, table):
@@ -511,11 +389,9 @@ def test_dspark_standard_dsa_prefers_runner_per_group_metadata(monkeypatch):
         input_ids=torch.zeros(2, dtype=torch.int64),
         positions=torch.zeros(2, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(2, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(2, dtype=torch.int32),
         _dspark_seed_buffer=torch.full((2,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(4, 2, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(4, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(4, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(4, dtype=torch.int32),
         _dspark_per_group_block_tables={},
         _dspark_per_group_slot_mappings={},
@@ -531,9 +407,7 @@ def test_dspark_standard_dsa_prefers_runner_per_group_metadata(monkeypatch):
             )
         ],
     )
-    proposer._assign_request_slots = lambda size: [3]
     proposer.set_per_group_attn_metadata = AscendDSparkProposer.set_per_group_attn_metadata.__get__(proposer)
-    proposer._get_draft_block_table = AscendDSparkProposer._get_draft_block_table.__get__(proposer)
     proposer._get_draft_block_table_for_gid = AscendDSparkProposer._get_draft_block_table_for_gid.__get__(proposer)
     proposer._get_draft_block_tables = AscendDSparkProposer._get_draft_block_tables.__get__(proposer)
     proposer._layer_map_from_gid_map = AscendDSparkProposer._layer_map_from_gid_map.__get__(proposer)
@@ -576,15 +450,14 @@ def test_dspark_standard_dsa_prefers_runner_per_group_metadata(monkeypatch):
         num_rejected_tokens_gpu=None,
     )
 
-    torch.testing.assert_close(proposer._dspark_block_table, runner_block_table)
-    assert proposer._dspark_block_table.data_ptr() != runner_block_table.data_ptr()
+    torch.testing.assert_close(proposer._dspark_block_tables_by_gid[1], runner_block_table)
+    assert proposer._dspark_block_tables_by_gid[1].data_ptr() != runner_block_table.data_ptr()
     torch.testing.assert_close(proposer._context_slot_mapping_buffer[:2], torch.tensor([45, 46], dtype=torch.int32))
     torch.testing.assert_close(cad.slot_mapping, torch.tensor([47, 48], dtype=torch.int32))
-    assert proposer._dspark_block_tables_by_layer["draft.swa"] is proposer._dspark_block_table
+    assert proposer._dspark_block_tables_by_layer["draft.swa"] is proposer._dspark_block_tables_by_gid[1]
 
 
 def test_dspark_standard_dsa_keeps_per_layer_block_tables(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     class FakeBlockTable:
         def __init__(self, table):
@@ -614,15 +487,12 @@ def test_dspark_standard_dsa_keeps_per_layer_block_tables(monkeypatch):
     proposer.input_ids = torch.zeros(4, dtype=torch.int64)
     proposer.positions = torch.zeros(4, dtype=torch.int32)
     proposer._slot_mapping_buffer = torch.zeros(4, dtype=torch.int32)
-    proposer._request_slots_buffer = torch.zeros(4, dtype=torch.int32)
     proposer._dspark_seed_buffer = torch.full((2,), -1, dtype=torch.int64)
     proposer._dflash_hidden_states = torch.zeros(8, 2, dtype=torch.float32)
     proposer._context_positions_buffer = torch.zeros(8, dtype=torch.int32)
-    proposer._context_request_slots_buffer = torch.zeros(8, dtype=torch.int32)
     proposer._context_slot_mapping_buffer = torch.zeros(8, dtype=torch.int32)
     proposer._dspark_query_slot_mapping_buffers = {}
     proposer._dspark_context_slot_mapping_buffers = {}
-    proposer._assign_request_slots = lambda size: [0]
 
     group1_table = torch.tensor([[10, 11, 12]], dtype=torch.int32)
     group2_table = torch.tensor([[30, 31, 32, 33, 34]], dtype=torch.int32)
@@ -707,116 +577,6 @@ def test_dspark_standard_dsa_keeps_per_layer_block_tables(monkeypatch):
     torch.testing.assert_close(cad.slot_mapping, torch.tensor([47, 48], dtype=torch.int32))
 
 
-def test_dspark_set_inputs_first_pass_stores_rejected_context_tokens(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", "1")
-    device = torch.device("cpu")
-    block_size = 3
-    batch_size = 2
-    proposer = SimpleNamespace(
-        device=device,
-        num_speculative_tokens=block_size,
-        parallel_drafting_token_id=99,
-        kernel_block_size=8,
-        token_arange_np=np.arange(16, dtype=np.int32),
-        arange_dspark=torch.arange(64, dtype=torch.int32),
-        input_ids=torch.zeros(batch_size * block_size, dtype=torch.int64),
-        positions=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _slot_mapping_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _dspark_seed_buffer=torch.full((4,), -1, dtype=torch.int64),
-        _dflash_hidden_states=torch.zeros(8, 2, dtype=torch.float32),
-        _context_positions_buffer=torch.zeros(8, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(8, dtype=torch.int32),
-        _context_slot_mapping_buffer=torch.zeros(8, dtype=torch.int32),
-    )
-    proposer._assign_request_slots = lambda size: [2, 7]
-    proposer._get_draft_block_table = AscendDSparkProposer._get_draft_block_table.__get__(proposer)
-    proposer._slot_mapping_from_block_table = AscendDSparkProposer._slot_mapping_from_block_table.__get__(proposer)
-
-    target_positions = torch.tensor([10, 11, 12, 13, 30, 31, 32, 33], dtype=torch.int32)
-    target_hidden_states = torch.arange(16, dtype=torch.float32).view(8, 2)
-    next_token_ids = torch.tensor([101, 202], dtype=torch.int64)
-    num_rejected_tokens = torch.tensor([1, 2], dtype=torch.int32)
-    cad = AscendCommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, 4, 8], dtype=torch.int32),
-        seq_lens=torch.tensor([14, 34], dtype=torch.int32),
-        _seq_lens_cpu=torch.tensor([14, 34], dtype=torch.int32),
-        seq_lens_cpu=None,
-        num_computed_tokens_cpu=None,
-        num_reqs=batch_size,
-        num_actual_tokens=8,
-        num_input_tokens=8,
-        max_query_len=4,
-        actual_seq_lengths_q=[4, 4],
-        block_table_tensor=torch.tensor(
-            [
-                [10, 20, 30, 40, 50],
-                [11, 21, 31, 41, 51],
-            ],
-            dtype=torch.int32,
-        ),
-        slot_mapping=torch.arange(200, 208, dtype=torch.int32),
-        positions=target_positions,
-        attn_state=AscendAttentionState.SpecDecoding,
-        decode_token_per_req=1,
-        max_seq_len=34,
-    )
-
-    num_query_total, token_indices, returned_cad, maybe_graph_input = AscendDSparkProposer.set_inputs_first_pass(
-        proposer,
-        target_token_ids=torch.arange(8, dtype=torch.int64),
-        next_token_ids=next_token_ids,
-        target_positions=target_positions,
-        target_hidden_states=target_hidden_states,
-        token_indices_to_sample=None,
-        cad=cad,
-        num_rejected_tokens_gpu=num_rejected_tokens,
-    )
-
-    assert returned_cad is cad
-    assert maybe_graph_input is None
-    assert num_query_total == batch_size * block_size
-    torch.testing.assert_close(token_indices, torch.arange(6, dtype=torch.int32))
-    torch.testing.assert_close(
-        proposer.input_ids,
-        torch.tensor([101, 99, 99, 202, 99, 99], dtype=torch.int64),
-    )
-    torch.testing.assert_close(
-        proposer.positions,
-        torch.tensor([13, 14, 15, 32, 33, 34], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        cad.slot_mapping,
-        torch.tensor([165, 166, 167, 408, 409, 410], dtype=torch.int32),
-    )
-    torch.testing.assert_close(cad.query_start_loc, torch.tensor([0, 3, 6], dtype=torch.int32))
-    torch.testing.assert_close(cad.query_start_loc_cpu, torch.tensor([0, 3, 6], dtype=torch.int32))
-    torch.testing.assert_close(cad.seq_lens, torch.tensor([16, 35], dtype=torch.int32))
-    assert cad.max_query_len == block_size
-    assert cad.max_seq_len == 37
-    assert cad.num_actual_tokens == 6
-    assert cad.causal is False
-    assert cad.attn_state == AscendAttentionState.ChunkedPrefill
-    torch.testing.assert_close(
-        proposer._dflash_hidden_states[:8],
-        target_hidden_states,
-    )
-    torch.testing.assert_close(
-        proposer._context_positions_buffer[:8],
-        target_positions,
-    )
-    torch.testing.assert_close(
-        proposer._context_request_slots_buffer[:8],
-        torch.tensor([2, 2, 2, 2, 7, 7, 7, 7], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        proposer._context_slot_mapping_buffer[:8],
-        torch.arange(200, 208, dtype=torch.int32),
-    )
-    assert proposer._dflash_num_context == 8
-
-
 def test_dspark_build_model_inputs_first_pass_returns_query_slot_mapping():
     calls = []
 
@@ -826,43 +586,46 @@ def test_dspark_build_model_inputs_first_pass_returns_query_slot_mapping():
             context_states,
             context_positions,
             context_slot_mapping,
-            context_request_slots,
         ):
             calls.append(
                 (
                     context_states,
                     context_positions,
                     context_slot_mapping,
-                    context_request_slots,
                 )
             )
 
+    context_slot_mapping_by_layer = {"draft.swa": torch.tensor([50, 51, 52], dtype=torch.int32)}
+    query_slot_mapping_by_layer = {"draft.swa": torch.tensor([160, 161, 162], dtype=torch.int32)}
+    block_tables_by_layer = {"draft.swa": torch.tensor([[0]], dtype=torch.int32)}
     proposer = SimpleNamespace(
         _dflash_num_context=2,
-        _dspark_slots_to_reset=[],
         model=FakeModel(),
         _dflash_hidden_states=torch.arange(6, dtype=torch.float32).view(3, 2),
         _context_positions_buffer=torch.tensor([5, 6, 7], dtype=torch.int32),
-        _context_slot_mapping_buffer=torch.tensor([50, 51, 52], dtype=torch.int32),
-        _context_request_slots_buffer=torch.tensor([2, 2, 3], dtype=torch.int32),
+        _dspark_context_slot_mappings_by_layer=context_slot_mapping_by_layer,
+        _dspark_query_slot_mappings_by_layer=query_slot_mapping_by_layer,
+        _dspark_block_tables_by_layer=block_tables_by_layer,
         input_ids=torch.tensor([101, 99, 99], dtype=torch.int64),
         positions=torch.tensor([8, 9, 10], dtype=torch.int32),
-        _request_slots_buffer=torch.tensor([4, 4, 4], dtype=torch.int32),
-        _slot_mapping_buffer=torch.tensor([160, 161, 162], dtype=torch.int32),
+        _dspark_token_to_req_indices_buffer=torch.tensor([0, 0, 0], dtype=torch.int32),
     )
 
     model_inputs = AscendDSparkProposer.build_model_inputs_first_pass(proposer, 3)
 
     assert len(calls) == 1
-    context_states, context_positions, context_slot_mapping, context_request_slots = calls[0]
+    context_states, context_positions, context_slot_mapping = calls[0]
     torch.testing.assert_close(context_states, proposer._dflash_hidden_states[:2])
     torch.testing.assert_close(context_positions, proposer._context_positions_buffer[:2])
-    torch.testing.assert_close(context_slot_mapping, proposer._context_slot_mapping_buffer[:2])
-    torch.testing.assert_close(context_request_slots, proposer._context_request_slots_buffer[:2])
+    assert context_slot_mapping is context_slot_mapping_by_layer
     assert model_inputs["input_ids"].data_ptr() == proposer.input_ids.data_ptr()
     torch.testing.assert_close(model_inputs["positions"], proposer.positions)
-    torch.testing.assert_close(model_inputs["request_slots"], proposer._request_slots_buffer)
-    torch.testing.assert_close(model_inputs["slot_mapping"], proposer._slot_mapping_buffer)
+    assert set(model_inputs["slot_mapping"]) == {"draft.swa"}
+    torch.testing.assert_close(
+        model_inputs["slot_mapping"]["draft.swa"],
+        torch.tensor([160, 161, 162], dtype=torch.int32),
+    )
+    assert model_inputs["block_table"] is block_tables_by_layer
 
 
 class _FakeKVSpec:
@@ -910,7 +673,6 @@ class _FakeLayer:
 
 
 def test_dspark_initialize_attn_backend_standard_dsa(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
     monkeypatch.setattr(
         dspark_proposer_module,
         "get_layers_from_vllm_config",
@@ -1006,7 +768,6 @@ def test_dspark_build_standard_dsa_metadata_sets_query_buffers():
 
 
 def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     context_calls = []
 
@@ -1048,14 +809,12 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
             context_states,
             context_positions,
             context_slot_mapping,
-            context_request_slots,
         ):
             precompute_calls.append(
                 (
                     context_states.clone(),
                     context_positions.clone(),
                     clone_value(context_slot_mapping),
-                    context_request_slots.clone(),
                 )
             )
 
@@ -1065,7 +824,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
             input_ids,
             positions,
             inputs_embeds,
-            request_slots,
             slot_mapping,
             block_table,
             dspark_query_start_loc=None,
@@ -1077,7 +835,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
                 {
                     "input_ids": input_ids.clone(),
                     "positions": positions.clone(),
-                    "request_slots": request_slots.clone(),
                     "slot_mapping": clone_value(slot_mapping),
                     "block_table": clone_value(block_table),
                     "dspark_query_start_loc": clone_value(dspark_query_start_loc),
@@ -1107,7 +864,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
         input_ids=torch.zeros(6, dtype=torch.int64),
         positions=torch.zeros(6, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(6, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(6, dtype=torch.int32),
         _dspark_token_to_req_indices_buffer=torch.zeros(6, dtype=torch.int32),
         _dspark_token_to_req_indices=None,
         _dspark_query_start_loc=None,
@@ -1115,9 +871,7 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
         _dspark_seed_buffer=torch.full((2,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(4, 4, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(4, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(4, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(4, dtype=torch.int32),
-        _dspark_slots_to_reset=[],
         draft_attn_groups=[
             AttentionGroup(
                 _FakeBackend,
@@ -1128,7 +882,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
             )
         ],
     )
-    proposer._assign_request_slots = lambda size: [3]
 
     sample_calls = []
 
@@ -1138,7 +891,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
 
     proposer._sample_sequential = fake_sample_sequential
     proposer._pad_draft_query_buffers = AscendDSparkProposer._pad_draft_query_buffers.__get__(proposer)
-    proposer._get_draft_block_table = AscendDSparkProposer._get_draft_block_table.__get__(proposer)
     proposer._get_draft_block_table_for_gid = AscendDSparkProposer._get_draft_block_table_for_gid.__get__(proposer)
     proposer._get_draft_block_tables = AscendDSparkProposer._get_draft_block_tables.__get__(proposer)
     proposer._layer_map_from_gid_map = AscendDSparkProposer._layer_map_from_gid_map.__get__(proposer)
@@ -1198,10 +950,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
         model_calls[0]["positions"],
         torch.tensor([5, 6, 7, 8, 9, 0], dtype=torch.int32),
     )
-    torch.testing.assert_close(
-        model_calls[0]["request_slots"],
-        torch.tensor([3, 3, 3, 3, 3, 0], dtype=torch.int32),
-    )
     assert set(precompute_calls[0][2]) == {"draft.swa"}
     torch.testing.assert_close(precompute_calls[0][2]["draft.swa"], torch.tensor([3, 4], dtype=torch.int32))
     assert set(model_calls[0]["slot_mapping"]) == {"draft.swa"}
@@ -1231,7 +979,6 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
 
 
 def test_dspark_dummy_run_keeps_drafter_eager_when_graph_disabled(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
 
     context_calls = []
 
@@ -1267,9 +1014,8 @@ def test_dspark_dummy_run_keeps_drafter_eager_when_graph_disabled(monkeypatch):
             context_states,
             context_positions,
             context_slot_mapping,
-            context_request_slots,
         ):
-            del context_states, context_positions, context_slot_mapping, context_request_slots
+            del context_states, context_positions, context_slot_mapping
 
         def __call__(
             self,
@@ -1277,11 +1023,14 @@ def test_dspark_dummy_run_keeps_drafter_eager_when_graph_disabled(monkeypatch):
             input_ids,
             positions,
             inputs_embeds,
-            request_slots,
             slot_mapping,
             block_table,
+            dspark_query_start_loc=None,
+            dspark_seq_lens=None,
+            dspark_token_to_req_indices=None,
         ):
-            del positions, inputs_embeds, request_slots, slot_mapping, block_table
+            del positions, inputs_embeds, slot_mapping, block_table
+            del dspark_query_start_loc, dspark_seq_lens, dspark_token_to_req_indices
             return torch.zeros((input_ids.numel(), 4), dtype=torch.float32)
 
     proposer = SimpleNamespace(
@@ -1301,11 +1050,9 @@ def test_dspark_dummy_run_keeps_drafter_eager_when_graph_disabled(monkeypatch):
         positions=torch.zeros(8, dtype=torch.int32),
         hidden_states=torch.zeros(8, 4, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(8, dtype=torch.int32),
-        _context_request_slots_buffer=torch.zeros(8, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(8, dtype=torch.int32),
-        _request_slots_buffer=torch.zeros(8, dtype=torch.int32),
         parallel_drafting_token_id=99,
-        draft_attn_groups=[object()],
+        draft_attn_groups=[],
     )
     proposer._pad_draft_query_buffers = AscendDSparkProposer._pad_draft_query_buffers.__get__(proposer)
     proposer._update_full_graph_params = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -1330,7 +1077,6 @@ def test_dspark_attention_uses_standard_cache_pta_when_enabled(monkeypatch):
         calls.append((args, kwargs))
         return torch.full_like(args[0], 3.0)
 
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
     monkeypatch.setattr(
         dspark_model_module,
         "dspark_attention_from_standard_cache",
@@ -1365,33 +1111,17 @@ def test_dspark_attention_uses_standard_cache_pta_when_enabled(monkeypatch):
     assert calls[0][0][2] is block_table
     assert calls[0][0][3] is positions
     assert calls[0][0][4] is slot_mapping
-    assert calls[0][0][5] is None
-    assert calls[0][0][8] == 4
-    assert calls[0][0][9] == 8
+    torch.testing.assert_close(calls[0][0][5], torch.tensor([0.5], dtype=torch.float32))
+    assert calls[0][0][6] == 2
+    assert calls[0][0][7] == 4
+    assert calls[0][0][8] == 8
+    assert calls[0][0][9] == 0.25
     torch.testing.assert_close(output, torch.full_like(q, 3.0))
-
-
-def test_dspark_standard_swa_store_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", "1")
-
-    class FailIfTouched:
-        @property
-        def swa_cache_layer(self):
-            raise AssertionError("standard SWA cache must not be touched when disabled")
-
-    attention = SimpleNamespace(dsa_attn=FailIfTouched())
-
-    dspark_model_module.DeepseekV4DSparkAttention._store_standard_swa_kv(
-        attention,
-        torch.zeros(1, 1, 4),
-        torch.tensor([0], dtype=torch.int32),
-    )
 
 
 def test_dspark_standard_swa_store_unwraps_singleton_cache(monkeypatch):
     from vllm_ascend.device import device_op as device_op_module
 
-    monkeypatch.delenv("VLLM_ASCEND_DSPARK_USE_PRIVATE_CACHE", raising=False)
     calls = []
 
     def fake_scatter(cache, shared_kv, slot_mapping):
