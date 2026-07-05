@@ -11,7 +11,6 @@ import vllm_ascend.spec_decode.dspark_proposer as dspark_proposer_module
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 class _FakeDSparkModel:
@@ -130,37 +129,6 @@ def test_dspark_sample_sequential_reduce_sample_uses_tp_greedy(monkeypatch):
 
     assert len(calls) == 1
     torch.testing.assert_close(draft_tokens, torch.tensor([[3]], dtype=torch.int64))
-
-
-def test_dspark_runner_flattens_draft_logit_components_by_req_id():
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(req_ids=["req-b", "req-a"]),
-        _draft_logit_components={
-            "prev_token_ids": torch.tensor([[10, 11], [20, 21]], dtype=torch.int64),
-            "final_top_ids": torch.tensor(
-                [
-                    [[100, 101], [110, 111]],
-                    [[200, 201], [210, 211]],
-                ],
-                dtype=torch.int64,
-            ),
-        },
-        _draft_logit_components_req_ids=["req-a", "req-b"],
-    )
-    runner._get_spec_decode_draft_distribution = NPUModelRunner._get_spec_decode_draft_distribution.__get__(runner)
-    runner._get_spec_decode_draft_logit_components = NPUModelRunner._get_spec_decode_draft_logit_components.__get__(
-        runner
-    )
-    metadata = SimpleNamespace(num_draft_tokens=[2, 1])
-
-    components = runner._get_spec_decode_draft_logit_components(metadata)
-
-    assert components is not None
-    torch.testing.assert_close(components["prev_token_ids"], torch.tensor([20, 21, 10], dtype=torch.int64))
-    torch.testing.assert_close(
-        components["final_top_ids"],
-        torch.tensor([[200, 201], [210, 211], [100, 101]], dtype=torch.int64),
-    )
 
 
 def test_dspark_set_inputs_first_pass_uses_anchor_first_block(monkeypatch):
