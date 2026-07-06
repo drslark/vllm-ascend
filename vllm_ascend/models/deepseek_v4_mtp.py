@@ -32,6 +32,7 @@ from .deepseek_v4 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV4MoE,
+    _hc_head_torch,
     get_spec_layer_idx_from_weight_name,
 )
 
@@ -131,13 +132,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         return hidden_states
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = torch.nn.functional.linear(x, hc_fn) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
-        return y.to(dtype)
+        return _hc_head_torch(x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps)
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):

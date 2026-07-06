@@ -8,15 +8,12 @@ module. The target model provides selected layer hidden states; this model
 projects them into the draft attention context and emits a full draft block.
 """
 
-import json
-import os
 import typing
 from collections.abc import Iterable
 
 import regex as re
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -35,7 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.sequence import IntermediateTensors
 
 from vllm_ascend import envs
 from vllm_ascend.models.deepseek_v4 import (
@@ -58,10 +54,6 @@ from vllm_ascend.ops.dspark_attention import (
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.scale$")
 _LAYER_ID_RE = re.compile(r"model\.layers\.(\d+)\.")
 
-_FP8_E4M3FN_SUBNORMAL_STEP = 2.0**-9
-_FP8_E4M3FN_MIN_NORMAL = 2.0**-6
-_FP8_E4M3FN_SUBNORMAL_NORMAL_MIDPOINT = (7 * _FP8_E4M3FN_SUBNORMAL_STEP + _FP8_E4M3FN_MIN_NORMAL) * 0.5
-
 
 def _draft_quant_config(vllm_config: VllmConfig):
     assert vllm_config.speculative_config is not None
@@ -69,102 +61,6 @@ def _draft_quant_config(vllm_config: VllmConfig):
     if getattr(draft_config, "dspark_mtp_dequantized_to_bf16", False):
         return None
     return vllm_config.quant_config
-
-
-def _should_apply_dspark_fp8_qdq(config: PretrainedConfig) -> bool:
-    return not (
-        getattr(config, "dspark_mtp_dequantized_to_bf16", False)
-        or getattr(config, "dspark_full_dequantized_to_bf16", False)
-    )
-
-
-def _dspark_mhc_pre_torch(
-    residual: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_alpha: float,
-    sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dtype = residual.dtype
-    hc_mult = residual.shape[-2]
-    hidden_size = residual.shape[-1]
-    outer_shape = residual.shape[:-2]
-    residual_flat = residual.reshape(-1, hc_mult, hidden_size)
-    residual_hc = residual_flat.reshape(-1, hc_mult * hidden_size).float()
-    mixes = F.linear(residual_hc, hc_fn.float())
-    mixes = mixes * torch.rsqrt(residual_hc.square().mean(dim=-1, keepdim=True) + rms_eps)
-
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
-
-    post_start = hc_mult
-    post_end = 2 * hc_mult
-    post_logits = mixes[:, post_start:post_end] * hc_scale[1] + hc_base[post_start:post_end]
-    post_mix = torch.sigmoid(post_logits) * hc_post_alpha
-
-    comb_logits = mixes[:, post_end:].reshape(-1, hc_mult, hc_mult) * hc_scale[2] + hc_base[post_end:].reshape(
-        1, hc_mult, hc_mult
-    )
-    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(max(int(sinkhorn_repeat) - 1, 0)):
-        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
-        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-
-    layer_input = torch.sum(pre_mix.unsqueeze(-1) * residual_flat.float(), dim=1).to(dtype)
-    return (
-        layer_input.reshape(*outer_shape, hidden_size),
-        post_mix.reshape(*outer_shape, hc_mult, 1),
-        comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
-    )
-
-
-def _dspark_mhc_post_torch(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_mix: torch.Tensor,
-    res_mix: torch.Tensor,
-) -> torch.Tensor:
-    mixed_residual = torch.einsum(
-        "...ij,...ih->...jh",
-        res_mix.float(),
-        residual.float(),
-    )
-    post_term = post_mix.float() * x.unsqueeze(-2).float()
-    return (mixed_residual + post_term).to(residual.dtype)
-
-
-def _dspark_mhc_fused_post_pre_torch(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_mix: torch.Tensor,
-    res_mix: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_alpha: float,
-    sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    residual_cur = _dspark_mhc_post_torch(x, residual, post_mix, res_mix)
-    layer_input, post_mix_cur, res_mix_cur = _dspark_mhc_pre_torch(
-        residual_cur,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_alpha,
-        sinkhorn_repeat,
-    )
-    return residual_cur, post_mix_cur, res_mix_cur, layer_input
 
 
 def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
@@ -176,14 +72,6 @@ def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
 
 def _dspark_standard_dsa_sas_enabled() -> bool:
     return not envs.VLLM_ASCEND_DSPARK_USE_PTA_REF
-
-
-def _dspark_kv_write_trace_path() -> str | None:
-    return envs.VLLM_ASCEND_DSPARK_KV_WRITE_TRACE_PATH
-
-
-def _dspark_kv_write_trace_max_records() -> int:
-    return envs.VLLM_ASCEND_DSPARK_KV_WRITE_TRACE_MAX_RECORDS
 
 
 def _sync_npu_device_for_standard_pta(tensor: torch.Tensor) -> None:
@@ -218,60 +106,6 @@ def _get_layer_prefix(layer: nn.Module, layer_key: str) -> str:
     )
 
 
-def _fp8_e4m3fn_quantized_abs(abs_scaled: torch.Tensor) -> torch.Tensor:
-    subnormal = torch.floor(abs_scaled / _FP8_E4M3FN_SUBNORMAL_STEP + 0.5).clamp(0, 7) * _FP8_E4M3FN_SUBNORMAL_STEP
-
-    normal_exp = torch.floor(torch.log2(abs_scaled.clamp_min(_FP8_E4M3FN_MIN_NORMAL))).clamp(-6, 8)
-    normal_base = torch.exp2(normal_exp)
-    mantissa = torch.floor((abs_scaled / normal_base - 1.0) * 8.0 + 0.5)
-    carry = mantissa >= 8
-    normal_exp = torch.where(carry, normal_exp + 1.0, normal_exp).clamp(-6, 8)
-    mantissa = torch.where(carry, torch.zeros_like(mantissa), mantissa)
-    mantissa = torch.where(
-        normal_exp >= 8,
-        mantissa.clamp(0, 6),
-        mantissa.clamp(0, 7),
-    )
-    normal = (1.0 + mantissa / 8.0) * torch.exp2(normal_exp)
-
-    return torch.where(
-        abs_scaled < _FP8_E4M3FN_SUBNORMAL_NORMAL_MIDPOINT,
-        subnormal,
-        normal,
-    )
-
-
-def _fp8_e4m3fn_qdq(x: torch.Tensor, block_size: int) -> torch.Tensor:
-    if x.numel() == 0:
-        return x
-
-    orig_shape = x.shape
-    last_dim = orig_shape[-1]
-    assert last_dim % block_size == 0
-    x_view = x.float().reshape(-1, last_dim)
-    blocks = x_view.reshape(-1, last_dim // block_size, block_size)
-    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
-    scale = torch.pow(
-        torch.full((), 2.0, dtype=torch.float32, device=x.device),
-        torch.ceil(torch.log2(amax / 448.0)),
-    )
-    scaled = (blocks / scale).clamp(-448.0, 448.0)
-
-    quantized_abs = _fp8_e4m3fn_quantized_abs(scaled.abs())
-    qdq = torch.where(scaled < 0, -quantized_abs, quantized_abs) * scale
-    return qdq.reshape(orig_shape).to(x.dtype)
-
-
-def _maybe_fp8_e4m3fn_qdq(
-    x: torch.Tensor,
-    apply_fp8_qdq: bool,
-    block_size: int,
-) -> torch.Tensor:
-    if not apply_fp8_qdq:
-        return x
-    return _fp8_e4m3fn_qdq(x, block_size)
-
-
 class DeepseekV4DSparkAttention(DeepseekV4Attention):
     """DSpark sliding-window attention with an internal eager context cache."""
 
@@ -281,8 +115,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         self.compress_ratio = 1
         self.dsa_attn.compress_ratio = 1
         self.block_size = int(config.dspark_block_size)
-        self._dspark_apply_fp8_qdq = _should_apply_dspark_fp8_qdq(config)
-        self._dspark_kv_write_trace_records = 0
 
     def _project_shared_kv(
         self,
@@ -324,39 +156,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         # The PTA reference reads the raw SWA cache immediately after scatter,
         # outside the normal DSA attention op stream choreography.
         _sync_npu_device_for_standard_pta(shared_kv)
-
-    _store_standard_swa_context_kv = _store_standard_swa_kv
-
-    def _maybe_dump_standard_kv_write_trace(
-        self,
-        phase: str,
-        positions: torch.Tensor,
-        slot_mapping: torch.Tensor | None,
-    ) -> None:
-        path = _dspark_kv_write_trace_path()
-        if not path or slot_mapping is None:
-            return
-        if self._dspark_kv_write_trace_records >= _dspark_kv_write_trace_max_records():
-            return
-        valid = slot_mapping >= 0 if slot_mapping.ndim == 1 else torch.all(slot_mapping >= 0, dim=-1)
-        valid_positions = positions[valid] if valid.numel() == positions.numel() else positions
-        valid_slots = slot_mapping[valid] if valid.numel() == slot_mapping.shape[0] else slot_mapping
-        record = {
-            "pid": os.getpid(),
-            "rank": os.getenv("RANK"),
-            "local_rank": os.getenv("LOCAL_RANK"),
-            "prefix": getattr(self.dsa_attn, "prefix", None),
-            "phase": phase,
-            "num_tokens": int(positions.numel()),
-            "num_valid_tokens": int(valid.sum().item()) if valid.numel() else 0,
-            "positions_head": valid_positions.detach().cpu()[:16].tolist(),
-            "positions_tail": valid_positions.detach().cpu()[-16:].tolist(),
-            "slot_mapping_head": valid_slots.detach().cpu()[:16].tolist(),
-            "slot_mapping_tail": valid_slots.detach().cpu()[-16:].tolist(),
-        }
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=True) + "\n")
-        self._dspark_kv_write_trace_records += 1
 
     def _standard_query_slot_mapping_from_block_table(
         self,
@@ -490,20 +289,17 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             return
         shared_kv = self._project_shared_kv(main_x, positions)
         self._store_standard_swa_kv(shared_kv, context_slot_mapping)
-        self._maybe_dump_standard_kv_write_trace("context", positions, context_slot_mapping)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        llama_4_scaling: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         block_table: torch.Tensor | None = None,
         dspark_query_start_loc: torch.Tensor | None = None,
         dspark_seq_lens: torch.Tensor | None = None,
         dspark_token_to_req_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del llama_4_scaling
         qr = self.q_norm(_linear_output(self.wq_a, hidden_states))
         kv = self.kv_norm(_linear_output(self.wkv, hidden_states))
 
@@ -522,7 +318,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             dspark_token_to_req_indices,
         )
         self._store_standard_swa_kv(shared_kv, standard_slot_mapping)
-        self._maybe_dump_standard_kv_write_trace("query", positions, standard_slot_mapping)
         standard_attn_out = self._run_standard_dspark_attention(
             q,
             positions,
@@ -548,7 +343,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         )
         group_dim = self.n_local_heads * self.head_dim // self.n_local_groups
         attn_out = attn_out.reshape(-1, self.n_local_groups, group_dim)
-        attn_out = _maybe_fp8_e4m3fn_qdq(attn_out, self._dspark_apply_fp8_qdq, 128)
         wo_a = _wo_a_weight_for_eager_projection(
             self.wo_a.weight,
             self.n_local_groups,
@@ -574,61 +368,6 @@ class DeepseekV4DSparkDecoderLayer(DeepseekV2DecoderLayer):
             quant_config_override=_draft_quant_config(vllm_config),
             use_quant_config_override=True,
         )
-        self.hc_post_alpha = 2.0
-
-    def _mhc_pre(
-        self,
-        hidden_states: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _dspark_mhc_pre_torch(
-            hidden_states,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-        )
-
-    def _mhc_post(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-    ) -> torch.Tensor:
-        return _dspark_mhc_post_torch(hidden_states, residual, post_mix, res_mix)
-
-    def _mhc_fused_post_pre(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _dspark_mhc_fused_post_pre_torch(
-            hidden_states,
-            residual,
-            post_mix,
-            res_mix,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-        )
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -636,7 +375,6 @@ class DeepseekV4DSparkDecoderLayer(DeepseekV2DecoderLayer):
         residual: torch.Tensor | None = None,
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
-        llama_4_scaling: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         block_table: torch.Tensor | None = None,
@@ -644,25 +382,23 @@ class DeepseekV4DSparkDecoderLayer(DeepseekV2DecoderLayer):
         dspark_seq_lens: torch.Tensor | None = None,
         dspark_token_to_req_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        del llama_4_scaling
+        # MHC pre/post reuse the upstream NPU fused ops ``npu_hc_pre_v2`` /
+        # ``npu_hc_post`` inherited from DeepseekV2DecoderLayer instead of the
+        # torch reference. The torch reference fused the previous step's post
+        # with the current step's pre into one call; here they are two NPU ops,
+        # numerically equivalent at the bf16 ulp level (the NPU op hardcodes the
+        # post alpha of 2.0; equivalence was verified against a torch reference
+        # before that reference was removed).
         if residual is None:
             residual = hidden_states
-            hidden_states, post_mix, res_mix = self._mhc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+            hidden_states, post_mix, res_mix = self.hc_pre(
+                hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         else:
             assert post_mix is not None and res_mix is not None
-            residual, post_mix, res_mix, hidden_states = self._mhc_fused_post_pre(
-                hidden_states,
-                residual,
-                post_mix,
-                res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+            residual = self.hc_post(hidden_states, residual, post_mix, res_mix)
+            hidden_states, post_mix, res_mix = self.hc_pre(
+                residual, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {
@@ -678,18 +414,12 @@ class DeepseekV4DSparkDecoderLayer(DeepseekV2DecoderLayer):
         hidden_states = self.self_attn(
             positions,
             hidden_states,
-            None,
             **attn_kwargs,
         )
 
-        residual, post_mix, res_mix, hidden_states = self._mhc_fused_post_pre(
-            hidden_states,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
+        residual = self.hc_post(hidden_states, residual, post_mix, res_mix)
+        hidden_states, post_mix, res_mix = self.hc_pre(
+            residual, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, input_ids)
@@ -797,9 +527,6 @@ class DeepseekV4DSparkModel(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.dsa_attn.swa_cache_layer.prefix for layer in self.layers.values()]
 
-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.main_norm(_linear_output(self.main_proj, aux_hidden_states))
-
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -813,6 +540,7 @@ class DeepseekV4DSparkModel(nn.Module):
     ) -> None:
         if context_states.numel() == 0:
             return
+        main_x = self.main_norm(_linear_output(self.main_proj, context_states))
         for layer_idx, (layer_key, layer) in enumerate(self.layers.items()):
             layer_prefix = _get_layer_prefix(layer, layer_key)
             layer_context_slot_mapping = _select_layer_value(
@@ -822,7 +550,7 @@ class DeepseekV4DSparkModel(nn.Module):
                 layer_prefix,
             )
             layer.self_attn.precompute_context_kv(
-                context_states,
+                main_x,
                 context_positions,
                 context_slot_mapping=layer_context_slot_mapping,
             )
@@ -832,14 +560,12 @@ class DeepseekV4DSparkModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-        hidden_states: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | dict[str, torch.Tensor] | dict[int, torch.Tensor] | None = None,
         block_table: torch.Tensor | dict[str, torch.Tensor] | dict[int, torch.Tensor] | None = None,
         dspark_query_start_loc: torch.Tensor | None = None,
         dspark_seq_lens: torch.Tensor | None = None,
         dspark_token_to_req_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del hidden_states
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
@@ -882,7 +608,14 @@ class DeepseekV4DSparkModel(nn.Module):
         res_mix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if residual is not None and post_mix is not None and res_mix is not None:
-            hidden_states = _dspark_mhc_post_torch(hidden_states, residual, post_mix, res_mix)
+            # Final MHC post of the last decoder layer's output, reusing the
+            # upstream NPU op (mirrors DeepseekV2DecoderLayer.hc_post).
+            hidden_states = torch.ops._C_ascend.npu_hc_post(
+                hidden_states.unsqueeze(0),
+                residual.unsqueeze(0),
+                post_mix.unsqueeze(0),
+                res_mix.unsqueeze(0),
+            ).squeeze(0)
         if hidden_states.dim() == 2:
             return hidden_states
         return _hc_head_torch(
@@ -956,23 +689,18 @@ class DeepSeekV4DSparkMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        spec_step_idx: int = 0,
         slot_mapping: torch.Tensor | None = None,
         block_table: torch.Tensor | None = None,
         dspark_query_start_loc: torch.Tensor | None = None,
         dspark_seq_lens: torch.Tensor | None = None,
         dspark_token_to_req_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del intermediate_tensors, spec_step_idx
         assert input_ids is not None
         return self.model(
             input_ids=input_ids,
             positions=positions,
             inputs_embeds=inputs_embeds,
-            hidden_states=hidden_states,
             slot_mapping=slot_mapping,
             block_table=block_table,
             dspark_query_start_loc=dspark_query_start_loc,
@@ -1000,9 +728,6 @@ class DeepSeekV4DSparkMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return self.model.get_draft_kv_cache_layer_names()
-
-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.model.combine_hidden_states(aux_hidden_states)
 
     def precompute_and_store_context_kv(
         self,

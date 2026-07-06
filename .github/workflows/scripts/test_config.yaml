@@ -335,7 +335,6 @@
   source_file_dependencies:
     - vllm_ascend/ops/cv_linear.py
     - vllm_ascend/ops/dsa.py
-    - vllm_ascend/ops/mhc.py
     - vllm_ascend/ops/rope_dsv4.py
   tests:
     - tests/e2e/pull_request/four_card/test_deepseek_v4.py
