@@ -130,6 +130,7 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
@@ -638,6 +639,12 @@ class NPUModelRunner(GPUModelRunner):
                 elif self.speculative_config.method == "extract_hidden_states":
                     assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
                     self.use_aux_hidden_state_outputs = True
+                elif (
+                    self.speculative_config.method == "mtp"
+                    and getattr(self.speculative_config.draft_model_config.hf_config, "dspark_block_size", 0)
+                ):
+                    assert isinstance(self.drafter, AscendDSparkProposer)
+                    self.use_aux_hidden_state_outputs = True
                 self.rejection_sampler = AscendRejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
@@ -657,6 +664,22 @@ class NPUModelRunner(GPUModelRunner):
         if eagle_config is None:
             return True
         return eagle_config.get("use_aux_hidden_state", True)
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        layer_ids = super()._get_eagle3_aux_layers_from_config()
+        if layer_ids:
+            return layer_ids
+        # The base method covers eagle/dflash aux layer ids but not dspark.
+        # Convert dspark_target_layer_ids to the aux-layer convention (+1) so
+        # the model's ``idx + 1 in aux_hidden_state_layers`` check collects the
+        # intended decoder layer outputs.
+        assert self.speculative_config is not None
+        assert self.speculative_config.draft_model_config is not None
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+        if dspark_layer_ids:
+            return tuple(i + 1 for i in dspark_layer_ids)
+        return None
 
     def _use_aclgraph(self) -> bool:
         return (
@@ -1833,7 +1856,10 @@ class NPUModelRunner(GPUModelRunner):
             mtp_hidden_states = getattr(
                 self.get_model(), "get_mtp_target_hidden_states", lambda: None
             )()
-            if mtp_hidden_states is not None:
+            if (
+                mtp_hidden_states is not None
+                and getattr(self.speculative_config.draft_model_config.hf_config, "dspark_block_size", 0)
+            ):
                 hidden_states = mtp_hidden_states
 
             num_rejected_tokens_gpu = None

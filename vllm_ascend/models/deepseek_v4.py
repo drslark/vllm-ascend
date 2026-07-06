@@ -56,7 +56,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
-from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsEagle, SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import EagleModelMixin, MixtureOfExperts, SupportsEagle3, SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
@@ -90,12 +90,9 @@ if not vllm_version_is("0.23.0"):
     from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 
 
-def _is_dspark_target_layer(layer_idx: int, target_layer_ids: set[int]) -> bool:
-    # DSpark configs follow upstream vLLM and store target layer numbers as
-    # 1-based decoder layer ids, while local layer_idx is 0-based.
-    return layer_idx + 1 in target_layer_ids
-
-
+"""
+Belows are all reused by dspark.
+"""
 def _make_deepseek_v4_expert_params_mapping(
     model: nn.Module,
     num_experts: int,
@@ -1110,7 +1107,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1193,14 +1190,6 @@ class DeepseekV4Model(nn.Module):
             dtype=vllm_config.model_config.dtype,
             device=self.device,
         )
-        self._dspark_target_layer_ids = list(getattr(config, "dspark_target_layer_ids", []) or [])
-        if self._dspark_target_layer_ids:
-            self._dspark_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                len(self._dspark_target_layer_ids) * config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
-                device=self.device,
-            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1240,12 +1229,11 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-        dspark_hiddens: list[torch.Tensor] = []
-        dspark_target_ids = set(self._dspark_target_layer_ids)
+        aux_hidden_states: list[torch.Tensor] = []
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
-            if _is_dspark_target_layer(layer.layer_idx, dspark_target_ids):
-                dspark_hiddens.append(hidden_states.mean(dim=1))
+            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
@@ -1267,14 +1255,6 @@ class DeepseekV4Model(nn.Module):
         else:
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
-        if self._dspark_target_layer_ids and dspark_hiddens:
-            dspark_states = torch.cat(dspark_hiddens, dim=-1)
-            if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
-                dspark_states = tensor_model_parallel_all_gather(dspark_states, dim=0)
-                pad_size = forward_ctx.pad_size
-                if pad_size > 0:
-                    dspark_states = dspark_states[:-pad_size]
-            self._dspark_hidden_buffer[: dspark_states.shape[0]].copy_(dspark_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1286,6 +1266,8 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -1295,6 +1277,7 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
     List of MoE MLP layers in the model.
     """
 
+    # reused by dspark
     def set_moe_parameters_from_layers(
         self,
         config: DeepseekV2Config | DeepseekV3Config | DeepseekV4Config,
@@ -1352,7 +1335,7 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle):
+class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle3):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
@@ -1416,9 +1399,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
-        if getattr(self.model, "_dspark_target_layer_ids", None):
-            return getattr(self.model, "_dspark_hidden_buffer", None)
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()

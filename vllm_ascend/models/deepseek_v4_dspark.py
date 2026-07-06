@@ -797,6 +797,9 @@ class DeepseekV4DSparkModel(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.dsa_attn.swa_cache_layer.prefix for layer in self.layers.values()]
 
+    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.main_norm(_linear_output(self.main_proj, aux_hidden_states))
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -810,7 +813,6 @@ class DeepseekV4DSparkModel(nn.Module):
     ) -> None:
         if context_states.numel() == 0:
             return
-        main_x = self.main_norm(_linear_output(self.main_proj, context_states))
         for layer_idx, (layer_key, layer) in enumerate(self.layers.items()):
             layer_prefix = _get_layer_prefix(layer, layer_key)
             layer_context_slot_mapping = _select_layer_value(
@@ -820,7 +822,7 @@ class DeepseekV4DSparkModel(nn.Module):
                 layer_prefix,
             )
             layer.self_attn.precompute_context_kv(
-                main_x,
+                context_states,
                 context_positions,
                 context_slot_mapping=layer_context_slot_mapping,
             )
@@ -998,6 +1000,9 @@ class DeepSeekV4DSparkMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return self.model.get_draft_kv_cache_layer_names()
+
+    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.combine_hidden_states(aux_hidden_states)
 
     def precompute_and_store_context_kv(
         self,

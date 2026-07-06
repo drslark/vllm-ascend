@@ -59,9 +59,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             )
         dspark_target_layer_ids = getattr(draft_hf_config, "dspark_target_layer_ids", None)
         if dspark_target_layer_ids:
-            self.hidden_size = vllm_config.speculative_config.draft_model_config.get_hidden_size() * len(
-                dspark_target_layer_ids
-            )
+            self.hidden_size = vllm_config.speculative_config.draft_model_config.get_hidden_size()
             self.hidden_states = torch.zeros(
                 (self.max_num_tokens, self.hidden_size),
                 dtype=self.dtype,
@@ -747,6 +745,8 @@ class AscendDSparkProposer(AscendDflashProposer):
             scheduler_output,
             num_scheduled_tokens,
         )
+
+        target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
 
         num_tokens, token_indices_to_sample, _, _ = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
