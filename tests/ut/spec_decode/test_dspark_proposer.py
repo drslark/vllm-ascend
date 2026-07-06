@@ -41,8 +41,8 @@ def test_dspark_sample_sequential_uses_previous_draft_token(monkeypatch):
     proposer = SimpleNamespace(
         num_speculative_tokens=3,
         model=_FakeDSparkModel(),
-        _dspark_seed_buffer=torch.tensor([1, 3], dtype=torch.int64),
-        _dspark_draft_buffer=torch.zeros((2, 3), dtype=torch.int64),
+        _markov_anchor_tokens=torch.tensor([1, 3], dtype=torch.int64),
+        _markov_draft_tokens=torch.zeros((2, 3), dtype=torch.int64),
     )
     head_hidden = torch.zeros((6, 5), dtype=torch.float32)
     token_indices = torch.arange(6, dtype=torch.int32)
@@ -54,7 +54,7 @@ def test_dspark_sample_sequential_uses_previous_draft_token(monkeypatch):
         token_indices_to_sample=token_indices,
     )
 
-    assert draft_tokens.data_ptr() == proposer._dspark_draft_buffer.data_ptr()
+    assert draft_tokens.data_ptr() == proposer._markov_draft_tokens.data_ptr()
     torch.testing.assert_close(
         draft_tokens,
         torch.tensor([[2, 3, 4], [4, 0, 1]], dtype=torch.int64),
@@ -80,8 +80,8 @@ def test_dspark_sample_sequential_full_vocab_greedy_uses_direct_argmax(monkeypat
     proposer = SimpleNamespace(
         num_speculative_tokens=1,
         model=model,
-        _dspark_seed_buffer=torch.tensor([0], dtype=torch.int64),
-        _dspark_draft_buffer=torch.zeros((1, 1), dtype=torch.int64),
+        _markov_anchor_tokens=torch.tensor([0], dtype=torch.int64),
+        _markov_draft_tokens=torch.zeros((1, 1), dtype=torch.int64),
     )
     head_hidden = torch.tensor([[0.0, 1.0, 8.0, 3.0]], dtype=torch.float32)
 
@@ -116,8 +116,8 @@ def test_dspark_sample_sequential_reduce_sample_uses_tp_greedy(monkeypatch):
     proposer = SimpleNamespace(
         num_speculative_tokens=1,
         model=model,
-        _dspark_seed_buffer=torch.tensor([0], dtype=torch.int64),
-        _dspark_draft_buffer=torch.zeros((1, 1), dtype=torch.int64),
+        _markov_anchor_tokens=torch.tensor([0], dtype=torch.int64),
+        _markov_draft_tokens=torch.zeros((1, 1), dtype=torch.int64),
     )
 
     draft_tokens = AscendDSparkProposer._sample_sequential(
@@ -174,11 +174,11 @@ def test_dspark_standard_dsa_uses_draft_group_block_table(monkeypatch):
             )
         ),
         token_arange_np=np.arange(16, dtype=np.int32),
-        arange_dspark=torch.arange(32, dtype=torch.int32),
+        arange_dflash=torch.arange(32, dtype=torch.int32),
         input_ids=torch.zeros(batch_size * block_size, dtype=torch.int64),
         positions=torch.zeros(batch_size * block_size, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(batch_size * block_size, dtype=torch.int32),
-        _dspark_seed_buffer=torch.full((4,), -1, dtype=torch.int64),
+        _markov_anchor_tokens=torch.full((4,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(8, 2, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(8, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(8, dtype=torch.int32),
@@ -287,11 +287,11 @@ def test_dspark_standard_dsa_keeps_compact_block_table_order(monkeypatch):
             )
         ),
         token_arange_np=np.arange(16, dtype=np.int32),
-        arange_dspark=torch.arange(32, dtype=torch.int32),
+        arange_dflash=torch.arange(32, dtype=torch.int32),
         input_ids=torch.zeros(block_size, dtype=torch.int64),
         positions=torch.zeros(block_size, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(block_size, dtype=torch.int32),
-        _dspark_seed_buffer=torch.full((2,), -1, dtype=torch.int64),
+        _markov_anchor_tokens=torch.full((2,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(4, 2, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(4, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(4, dtype=torch.int32),
@@ -385,11 +385,11 @@ def test_dspark_standard_dsa_prefers_runner_per_group_metadata(monkeypatch):
             )
         ),
         token_arange_np=np.arange(16, dtype=np.int32),
-        arange_dspark=torch.arange(32, dtype=torch.int32),
+        arange_dflash=torch.arange(32, dtype=torch.int32),
         input_ids=torch.zeros(2, dtype=torch.int64),
         positions=torch.zeros(2, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(2, dtype=torch.int32),
-        _dspark_seed_buffer=torch.full((2,), -1, dtype=torch.int64),
+        _markov_anchor_tokens=torch.full((2,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(4, 2, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(4, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(4, dtype=torch.int32),
@@ -483,11 +483,11 @@ def test_dspark_standard_dsa_keeps_per_layer_block_tables(monkeypatch):
     proposer.max_num_tokens = 8
     proposer.max_query_tokens = 4
     proposer.token_arange_np = np.arange(16, dtype=np.int32)
-    proposer.arange_dspark = torch.arange(32, dtype=torch.int32)
+    proposer.arange_dflash = torch.arange(32, dtype=torch.int32)
     proposer.input_ids = torch.zeros(4, dtype=torch.int64)
     proposer.positions = torch.zeros(4, dtype=torch.int32)
     proposer._slot_mapping_buffer = torch.zeros(4, dtype=torch.int32)
-    proposer._dspark_seed_buffer = torch.full((2,), -1, dtype=torch.int64)
+    proposer._markov_anchor_tokens = torch.full((2,), -1, dtype=torch.int64)
     proposer._dflash_hidden_states = torch.zeros(8, 2, dtype=torch.float32)
     proposer._context_positions_buffer = torch.zeros(8, dtype=torch.int32)
     proposer._context_slot_mapping_buffer = torch.zeros(8, dtype=torch.int32)
@@ -860,7 +860,7 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
         parallel_drafting_token_id=99,
         kernel_block_size=64,
         token_arange_np=np.arange(16, dtype=np.int32),
-        arange_dspark=torch.arange(32, dtype=torch.int32),
+        arange_dflash=torch.arange(32, dtype=torch.int32),
         input_ids=torch.zeros(6, dtype=torch.int64),
         positions=torch.zeros(6, dtype=torch.int32),
         _slot_mapping_buffer=torch.zeros(6, dtype=torch.int32),
@@ -868,7 +868,7 @@ def test_dspark_standard_dsa_propose_pads_model_inputs(monkeypatch):
         _dspark_token_to_req_indices=None,
         _dspark_query_start_loc=None,
         _dspark_seq_lens=None,
-        _dspark_seed_buffer=torch.full((2,), -1, dtype=torch.int64),
+        _markov_anchor_tokens=torch.full((2,), -1, dtype=torch.int64),
         _dflash_hidden_states=torch.zeros(4, 4, dtype=torch.float32),
         _context_positions_buffer=torch.zeros(4, dtype=torch.int32),
         _context_slot_mapping_buffer=torch.zeros(4, dtype=torch.int32),

@@ -110,20 +110,32 @@ class AscendDSparkProposer(AscendDflashProposer):
             dtype=torch.int32,
             device=device,
         )
-        self._dspark_seed_buffer = torch.zeros(
+        # Markov block drafting: ``_markov_anchor_tokens`` is the target model's
+        # next token (the seed that starts the Markov chain); ``_markov_draft_tokens``
+        # holds each step's sampled token and feeds it back as the next step's
+        # input. DSpark-only -- DFlash/Eagle sample in parallel without Markov.
+        self._markov_anchor_tokens = torch.zeros(
             self.max_batch_size,
             dtype=torch.int64,
             device=device,
         )
+        # Per-token -> request index map consumed by the SAS attention op. Sliced
+        # to num_query_total for real query tokens; padding slots in
+        # [num_actual_tokens, num_input_tokens) are filled with -1.
         self._dspark_token_to_req_indices_buffer = torch.zeros(
             self.max_query_tokens,
             dtype=torch.int32,
             device=device,
         )
         self._dspark_token_to_req_indices: torch.Tensor | None = None
+        # Cached slices of the runner's common_attn_metadata (cad): in
+        # set_inputs_first_pass they alias cad.query_start_loc_cpu / cad.seq_lens;
+        # in dummy_run/profile_run (no cad available) they are synthesized locally.
+        # Kept under the _dspark_ prefix because llm_base already defines
+        # self.query_start_loc for Eagle.
         self._dspark_query_start_loc: torch.Tensor | None = None
         self._dspark_seq_lens: torch.Tensor | None = None
-        self._dspark_draft_buffer = torch.zeros(
+        self._markov_draft_tokens = torch.zeros(
             (self.max_batch_size, self.num_speculative_tokens),
             dtype=torch.int64,
             device=device,
@@ -138,11 +150,6 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_context_slot_mappings_by_gid: dict[int, torch.Tensor] = {}
         self._dspark_query_slot_mappings_by_layer: dict[str, torch.Tensor] = {}
         self._dspark_context_slot_mappings_by_layer: dict[str, torch.Tensor] = {}
-        self.arange_dspark = torch.arange(
-            self.max_positions + 1,
-            device=device,
-            dtype=torch.int32,
-        )
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         self._draft_attn_layer_names: set[str] = set()
@@ -411,9 +418,9 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_context_slot_mappings_by_gid = {}
         self._dspark_query_slot_mappings_by_layer = {}
         self._dspark_context_slot_mappings_by_layer = {}
-        self._dspark_seed_buffer[:batch_size].copy_(next_token_ids)
-        if batch_size < self._dspark_seed_buffer.shape[0]:
-            self._dspark_seed_buffer[batch_size:].fill_(0)
+        self._markov_anchor_tokens[:batch_size].copy_(next_token_ids)
+        if batch_size < self._markov_anchor_tokens.shape[0]:
+            self._markov_anchor_tokens[batch_size:].fill_(0)
 
         context_cursor = 0
         for req_idx in range(batch_size):
@@ -467,7 +474,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             last_pos = target_positions[valid_ctx_end - 1]
             out_start = req_idx * block_size
             out_end = out_start + block_size
-            self.positions[out_start:out_end] = last_pos + 1 + self.arange_dspark[:block_size]
+            self.positions[out_start:out_end] = last_pos + 1 + self.arange_dflash[:block_size]
             self.input_ids[out_start] = next_token_ids[req_idx]
             if block_size > 1:
                 self.input_ids[out_start + 1 : out_end] = self.parallel_drafting_token_id
@@ -493,7 +500,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         if has_num_rejected:
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
 
-        cad.query_start_loc = self.arange_dspark[: batch_size + 1] * block_size
+        cad.query_start_loc = self.arange_dflash[: batch_size + 1] * block_size
         cad.seq_lens = effective_seq_lens + block_size
         cad.query_start_loc_cpu = (torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * block_size).to(
             torch.int32
@@ -564,7 +571,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_query_slot_mappings_by_layer = self._layer_map_from_gid_map(query_slot_mappings_by_gid)
         self._dspark_context_slot_mappings_by_layer = self._layer_map_from_gid_map(context_slot_mappings_by_gid)
         self._dspark_query_start_loc = (
-            self.arange_dspark[: batch_size + 1] * block_size
+            self.arange_dflash[: batch_size + 1] * block_size
         ).to(torch.int32)
         self._dspark_seq_lens = torch.full(
             (batch_size,), block_size, dtype=torch.int32, device=self.device
@@ -705,15 +712,15 @@ class AscendDSparkProposer(AscendDflashProposer):
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, block_size, vocab_size)
 
-        prev_ids = self._dspark_seed_buffer[:num_reqs]
+        prev_ids = self._markov_anchor_tokens[:num_reqs]
         for idx in range(block_size):
             markov_embed = self.model.markov_embed(prev_ids)
             markov_bias = self.model.markov_bias(markov_embed)
             logits = base_logits[:, idx, :] + markov_bias
             draft_ids = _dspark_greedy_sample(logits)
-            self._dspark_draft_buffer[:num_reqs, idx].copy_(draft_ids)
-            prev_ids = self._dspark_draft_buffer[:num_reqs, idx]
-        return self._dspark_draft_buffer[:num_reqs, :block_size]
+            self._markov_draft_tokens[:num_reqs, idx].copy_(draft_ids)
+            prev_ids = self._markov_draft_tokens[:num_reqs, idx]
+        return self._markov_draft_tokens[:num_reqs, :block_size]
 
     def _propose(
         self,
