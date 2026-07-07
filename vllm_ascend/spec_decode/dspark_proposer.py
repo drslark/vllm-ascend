@@ -647,7 +647,6 @@ class AscendDSparkProposer(AscendDflashProposer):
                 self.model(
                     input_ids=self.input_ids[:model_num_query_tokens],
                     positions=self.positions[:model_num_query_tokens],
-                    inputs_embeds=None,
                     slot_mapping=(
                         AscendDSparkProposer._slice_tensor_map(
                             getattr(self, "_dspark_query_slot_mappings_by_layer", {}),
@@ -683,7 +682,6 @@ class AscendDSparkProposer(AscendDflashProposer):
         return dict(
             input_ids=self.input_ids[:num_input_tokens],
             positions=self.positions[:num_input_tokens],
-            inputs_embeds=None,
             slot_mapping=AscendDSparkProposer._slice_tensor_map(
                 getattr(self, "_dspark_query_slot_mappings_by_layer", {}),
                 num_input_tokens,
@@ -800,7 +798,6 @@ class AscendDSparkProposer(AscendDflashProposer):
             hidden_states = self.model(
                 input_ids=self.input_ids[:model_num_tokens],
                 positions=self.positions[:model_num_tokens],
-                inputs_embeds=None,
                 slot_mapping=AscendDSparkProposer._slice_tensor_map(
                     getattr(self, "_dspark_query_slot_mappings_by_layer", {}),
                     model_num_tokens,

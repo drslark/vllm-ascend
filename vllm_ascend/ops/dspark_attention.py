@@ -10,14 +10,6 @@ DSPARK_SAS_MASK_MODE = 4
 DSPARK_SAS_CMP_MASK_MODE = 3
 
 
-def _dspark_sas_window(block_size: int, window_size: int) -> tuple[int, int, int]:
-    return (
-        DSPARK_SAS_MASK_MODE,
-        window_size + block_size - 1,
-        block_size - 1,
-    )
-
-
 def _dspark_sparse_sas_window(block_size: int, window_size: int) -> tuple[int, int, int]:
     # Compatibility scheduling bound for PA_ND + ori_sparse_indices. This is
     # not the DSpark visible-token definition; the slot list is authoritative.
@@ -309,8 +301,6 @@ def dspark_attention_from_standard_cache(
     cache_block_size: int,
     softmax_scale: float,
     *,
-    dspark_swa_indices: torch.Tensor | None = None,
-    dspark_swa_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     seq_lens: torch.Tensor | None = None,
     token_to_req_indices: torch.Tensor | None = None,
@@ -320,21 +310,17 @@ def dspark_attention_from_standard_cache(
     This mirrors upstream DSpark SWA metadata: each query in a draft block
     attends to the trailing context window plus the full current draft block.
     """
-    if (dspark_swa_indices is None) != (dspark_swa_lens is None):
-        raise ValueError("DSpark SWA indices and lens must be provided together")
-    if dspark_swa_indices is None:
-        dspark_swa_indices, dspark_swa_lens = build_dspark_swa_indices(
-            block_table,
-            positions,
-            slot_mapping,
-            block_size,
-            window_size,
-            cache_block_size,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            token_to_req_indices=token_to_req_indices,
-        )
-    assert dspark_swa_lens is not None
+    dspark_swa_indices, dspark_swa_lens = build_dspark_swa_indices(
+        block_table,
+        positions,
+        slot_mapping,
+        block_size,
+        window_size,
+        cache_block_size,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        token_to_req_indices=token_to_req_indices,
+    )
     out = torch.empty_like(q)
     out.zero_()
 
@@ -444,8 +430,6 @@ def dspark_attention_from_standard_cache_sas(
     query_start_loc: torch.Tensor | None,
     seq_lens: torch.Tensor | None,
     token_to_req_indices: torch.Tensor | None = None,
-    dspark_swa_indices: torch.Tensor | None = None,
-    dspark_swa_lens: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """SAS fast path over standard paged SWA cache.
 
@@ -462,21 +446,17 @@ def dspark_attention_from_standard_cache_sas(
     metadata_op, attn_op = ops
     try:
         standard_cache = _unwrap_single_kv_cache(standard_kv_cache)
-        if (dspark_swa_indices is None) != (dspark_swa_lens is None):
-            raise ValueError("DSpark SWA indices and lens must be provided together")
-        if dspark_swa_indices is None:
-            dspark_swa_indices, dspark_swa_lens = build_dspark_swa_indices(
-                block_table,
-                positions,
-                slot_mapping,
-                block_size,
-                window_size,
-                cache_block_size,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                token_to_req_indices=token_to_req_indices,
-            )
-        assert dspark_swa_lens is not None
+        dspark_swa_indices, dspark_swa_lens = build_dspark_swa_indices(
+            block_table,
+            positions,
+            slot_mapping,
+            block_size,
+            window_size,
+            cache_block_size,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            token_to_req_indices=token_to_req_indices,
+        )
         if not _dspark_sas_lens_match_scheduling(
             dspark_swa_lens,
             query_start_loc,

@@ -110,17 +110,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Force DSpark standard-cache attention to use the PTA reference path
-    # instead of SparseAttnSharedkv PA_ND.
-    "VLLM_ASCEND_DSPARK_USE_PTA_REF": lambda: bool(int(os.getenv("VLLM_ASCEND_DSPARK_USE_PTA_REF", "0"))),
-    # Whether to print DSpark rejection debug information.
-    "VLLM_ASCEND_DSPARK_REJECT_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_DSPARK_REJECT_DEBUG", "0"))),
-    # Optional JSONL path for DSpark standard-cache KV write tracing.
-    "VLLM_ASCEND_DSPARK_KV_WRITE_TRACE_PATH": lambda: os.getenv("VLLM_ASCEND_DSPARK_KV_WRITE_TRACE_PATH", None),
-    # Maximum KV write trace records written per DSpark attention layer.
-    "VLLM_ASCEND_DSPARK_KV_WRITE_TRACE_MAX_RECORDS": lambda: int(
-        os.getenv("VLLM_ASCEND_DSPARK_KV_WRITE_TRACE_MAX_RECORDS", "16")
-    ),
 }
 
 # end-env-vars-definition
