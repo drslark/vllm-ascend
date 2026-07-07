@@ -234,7 +234,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
-        if not self.use_cuda_graph and enable_sp(vllm_config):
+        if not self.use_cuda_graph:  # enable_sp(vllm_config) is skipped here, REMEMBER TO CHECK IT
             self.maybe_eager_context = _maybe_eager_context(vllm_config)
 
         self.token_indices_to_sample = torch.zeros(
@@ -298,9 +298,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         from vllm.compilation.backends import set_model_tag
 
         draft_vllm_config = self._create_draft_vllm_config()
-        if self.speculative_config.enforce_eager:
-            draft_vllm_config.model_config.enforce_eager = True
-            draft_vllm_config.compilation_config.mode = CompilationMode.NONE
         draft_load_config = self.speculative_config.draft_load_config
         logger.info(
             "[spec_decode/base] Loading draft model: method=%s, load_format=%s, model=%s",

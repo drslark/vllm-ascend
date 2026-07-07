@@ -547,7 +547,14 @@ class AscendDSparkProposer(AscendDflashProposer):
         batch_size = max(num_reqs, 1)
         block_size = self.num_speculative_tokens
         cache_block_size = int(self.draft_attn_groups[0].kv_cache_spec.block_size)
-        num_blocks = (self.max_positions + cache_block_size) // cache_block_size + 1
+        # The dummy SWA block table is captured into the target model's
+        # FULL_DECODE_ONLY aclgraph and reused (contents overwritten in place) at
+        # replay time, so its width must cover the full max_model_len -- not just
+        # the per-step max_positions. A too-small table makes the graph-captured
+        # draft attention gather block_table[req_idx] with absolute
+        # ``position // cache_block_size`` indices that overflow for long
+        # sequences (GatherV3 "Index out of range").
+        num_blocks = (int(self.max_model_len) + cache_block_size - 1) // cache_block_size
         block_tables_by_gid: dict[int, torch.Tensor] = {}
         query_slot_mappings_by_gid: dict[int, torch.Tensor] = {}
         context_slot_mappings_by_gid: dict[int, torch.Tensor] = {}
