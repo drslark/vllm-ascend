@@ -14,6 +14,7 @@ from collections.abc import Iterable
 import regex as re
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -33,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
 
+from vllm_ascend import envs
 from vllm_ascend.models.deepseek_v4 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
@@ -746,6 +748,8 @@ class DeepSeekV4DSparkMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         for name, loaded_weight in weights:
             if name == "embed.weight":
+                if envs.DSPARK_WEIGHT_DIR:
+                    loaded_weight = load_file(f"{envs.DSPARK_WEIGHT_DIR}/embed.safetensors")["embed.weight"]
                 embed_name = "model.embed_tokens.weight"
                 param = params_dict[embed_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -753,6 +757,8 @@ class DeepSeekV4DSparkMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 loaded_params.add(embed_name)
                 continue
             if name == "head.weight":
+                if envs.DSPARK_WEIGHT_DIR:
+                    loaded_weight = load_file(f"{envs.DSPARK_WEIGHT_DIR}/lmhead.safetensors")["head.weight"]
                 head_name = "lm_head.weight"
                 param = params_dict[head_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

@@ -395,6 +395,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         we share the target model's embedding layers with the draft model to save
         memory.
         """
+        # hack temporarily, specially for dspark now
+        if getattr(self.speculative_config.draft_model_config.hf_config, "dspark_block_size", 0):
+            return
         if get_pp_group().world_size == 1:
             if hasattr(target_language_model.model, "embed_tokens"):
                 target_embed_tokens = target_language_model.model.embed_tokens
@@ -462,6 +465,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         share_target_lm_head = (
             self.method in ("eagle", "dflash") or getattr(self.model, "has_own_lm_head", True) is False
         )
+        # hack temporarily, specially for dspark now
+        if getattr(self.speculative_config.draft_model_config.hf_config, "dspark_block_size", 0):
+            share_target_lm_head = False
         if share_target_lm_head:
             # For DFlash drafters trained with a reduced draft vocabulary, the
             # draft model ships its own lm_head of shape [draft_vocab_size,
