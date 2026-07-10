@@ -519,23 +519,12 @@ class DeepseekV4DSparkModel(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor
-        | list[torch.Tensor | None]
-        | tuple[torch.Tensor | None, ...]
-        | dict[str, torch.Tensor | None]
-        | dict[int, torch.Tensor | None]
-        | None = None,
+        context_slot_mapping: list[torch.Tensor | None] | None = None,
     ) -> None:
         if context_states.numel() == 0:
             return
-        for layer_idx, (layer_key, layer) in enumerate(self.layers.items()):
-            layer_prefix = _get_layer_prefix(layer, layer_key)
-            layer_context_slot_mapping = _select_layer_value(
-                context_slot_mapping,
-                layer_idx,
-                layer_key,
-                layer_prefix,
-            )
+        for layer_idx, layer in enumerate(self.layers.values()):
+            layer_context_slot_mapping = None if context_slot_mapping is None else context_slot_mapping[layer_idx]
             layer.self_attn.precompute_context_kv(
                 context_states,
                 context_positions,
@@ -710,12 +699,7 @@ class DeepSeekV4DSparkMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor
-        | list[torch.Tensor | None]
-        | tuple[torch.Tensor | None, ...]
-        | dict[str, torch.Tensor | None]
-        | dict[int, torch.Tensor | None]
-        | None = None,
+        context_slot_mapping: list[torch.Tensor | None] | None = None,
     ) -> None:
         self.model.precompute_and_store_context_kv(
             context_states,
