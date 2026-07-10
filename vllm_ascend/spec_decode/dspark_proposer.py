@@ -20,6 +20,9 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_co
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.llm_base_proposer import greedy_sample
+from vllm_ascend.ops.triton.spec_decode.utils import (
+    copy_and_expand_dflash_inputs_py,
+)
 
 
 def _dspark_reduce_sample_enabled() -> bool:
@@ -73,9 +76,21 @@ class AscendDSparkProposer(AscendDflashProposer):
         self.method = "dflash"
         self.parallel_drafting = True
         self.block_size = self.num_speculative_tokens
+        # Per-request extra KV slots = num_speculative_tokens (one slot per
+        # draft token in the block). Overrides upstream llm_base:100; v2 drops
+        # it (BlockTables manages slots).
         self.extra_slots_per_request = self.num_speculative_tokens
+        # Net new slots per request this step = num_speculative_tokens.
+        # Overrides llm_base:103; v2 drops it.
         self.net_num_new_slots_per_request = self.num_speculative_tokens
+        # DSpark always needs extra input slots for the draft block.
+        # Overrides llm_base:106; v2 drops it.
         self.needs_extra_input_slots = True
+        # [max_num_tokens] bool mask of rejected draft positions, set per step
+        # by the rejection sampler. getattr fallback because upstream
+        # llm_base:211 only builds it under its own needs_extra_input_slots
+        # branch, which runs before DSpark overrides that flag. v2 drops it
+        # (mask handled sampler-side).
         self.is_rejected_token_mask: torch.Tensor | None = getattr(self, "is_rejected_token_mask", None)
         if self.is_rejected_token_mask is None:
             self.is_rejected_token_mask = torch.zeros(
@@ -83,6 +98,8 @@ class AscendDSparkProposer(AscendDflashProposer):
                 dtype=torch.bool,
                 device=device,
             )
+        # [max_num_tokens] bool mask of non-anchor (noise) query positions in
+        # the draft block. Same getattr-fallback reason as above. v2 drops it.
         self.is_masked_token_mask: torch.Tensor | None = getattr(self, "is_masked_token_mask", None)
         if self.is_masked_token_mask is None:
             self.is_masked_token_mask = torch.zeros(
@@ -90,19 +107,33 @@ class AscendDSparkProposer(AscendDflashProposer):
                 dtype=torch.bool,
                 device=device,
             )
+        # Token id filling non-anchor (noise) positions of the draft block.
+        # From draft_hf_config.ptd_token_id (fallback dspark_noise_token_id, 0).
+        # Mirrors v2 dflash:47 get_parallel_drafting_token_id.
         self.parallel_drafting_token_id = getattr(
             draft_hf_config,
             "ptd_token_id",
             getattr(draft_hf_config, "dspark_noise_token_id", 0),
         )
+        # DSpark runs eager only (Ascend cudagraph unsupported on this path).
+        # Overrides ascend llm_base:214; v2 DSpark supports FULL graph.
         self.use_cuda_graph = False
+        # Max query tokens = max_batch_size * num_speculative_tokens
+        # (anchor-first: N query tokens per request, no bonus token, unlike
+        # DFlash's 1+N). Overrides dflash:28; v2 derives via num_query_per_req.
         self.max_query_tokens = self.max_batch_size * self.num_speculative_tokens
+        # max_num_tokens + max_query_tokens. Overrides dflash:29; v2 drops it.
         self.max_positions = self.max_num_tokens + self.max_query_tokens
+        # Position ids for the draft query block [max_query_tokens].
+        # Overrides dflash:49; v2 uses input_buffers.positions.
         self.positions = torch.zeros(
             self.max_query_tokens,
             dtype=torch.int32,
             device=device,
         )
+        # Primary-group query slot mapping buffer [max_query_tokens].
+        # Overrides dflash:37; v2 uses BlockTables.slot_mappings. Per-non-
+        # primary-gid buffers live in _dspark_query_slot_mapping_buffers.
         self._slot_mapping_buffer = torch.zeros(
             self.max_query_tokens,
             dtype=torch.int32,
@@ -138,88 +169,98 @@ class AscendDSparkProposer(AscendDflashProposer):
             dtype=torch.int64,
             device=device,
         )
+
+        # TODO simplify these comments
+        # block_table / slot_mapping bookkeeping (10 dicts below). v1 self-
+        # manages per kv_cache_group_id / per layer because it lacks v2's
+        # BlockTables scaffold; v2 injects a single self.block_tables
+        # (BlockTables, with .slot_mappings) + build_slot_mappings_by_layer,
+        # so the speculator holds none of these. P2 refactor target (move to
+        # runner). See /analysis/dspark-pr11431-proposer-init变量对照.md §4.
+        # per-gid block_table (current batch)
         self._dspark_block_tables_by_gid: dict[int, torch.Tensor] = {}
+        # per-layer block_table (from by_gid, for model forward)
         self._dspark_block_tables_by_layer: dict[str, torch.Tensor] = {}
+        # per-gid block_table from runner set_per_group_attn_metadata
         self._dspark_per_group_block_tables: dict[int, torch.Tensor] = {}
+        # per-gid slot_mapping from runner set_per_group_attn_metadata
         self._dspark_per_group_slot_mappings: dict[int, torch.Tensor] = {}
+        # per-gid query slot_mapping buffer (allocated on demand)
         self._dspark_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+        # per-gid context slot_mapping buffer (allocated on demand)
         self._dspark_context_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+        # current-batch per-gid query slot_mapping slice
         self._dspark_query_slot_mappings_by_gid: dict[int, torch.Tensor] = {}
+        # current-batch per-gid context slot_mapping slice
         self._dspark_context_slot_mappings_by_gid: dict[int, torch.Tensor] = {}
+        # per-layer query slot_mapping (for model forward)
         self._dspark_query_slot_mappings_by_layer: dict[str, torch.Tensor] = {}
         # per-layer context slot mappings as a flat list
         self._context_slots: list[torch.Tensor | None] = []
 
+
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
-        self._draft_attn_layer_names: set[str] = set()
-        self.attn_layer_names: list[str] = []
-        self.piece_all_attn_layer_name: list[list[str]] = [[] for _ in range(self.num_speculative_tokens)]
-        self.draft_attn_groups: list[Any] = []
-        self.kv_cache_gid = 0
-        self._layer_group_idx: list[int] | None = None
+        # Find draft layers (attention layers added by draft model)
+        all_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
 
-        if hasattr(self.model, "get_draft_kv_cache_layer_names"):
-            draft_attn_layer_names = set(self.model.get_draft_kv_cache_layer_names())
-            self._draft_attn_layer_names = draft_attn_layer_names
-            self.attn_layer_names = sorted(draft_attn_layer_names)
-            self.piece_all_attn_layer_name = [
-                [name for name in self.attn_layer_names] for _ in range(self.num_speculative_tokens)
-            ]
-
-            layers = get_layers_from_vllm_config(
-                self.vllm_config,
-                AttentionLayerBase,  # type: ignore[type-abstract]
+        attention_groups_list: list[dict[tuple[str, str], AttentionGroup]] = []
+        # the draft layers have multiple kv_cahce_groups
+        if not hasattr(self.model, "get_draft_kv_cache_layer_names"):
+            raise RuntimeError(
+                "DSpark standard-cache path requires the draft model to expose "
+                "get_draft_kv_cache_layer_names"
             )
 
-            for kv_cache_gid, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
-                layer_names = [name for name in kv_cache_group_spec.layer_names if name in draft_attn_layer_names]
-                if not layer_names:
-                    continue
+        self._draft_attn_layer_names = sorted(self.model.get_draft_kv_cache_layer_names())
 
-                attn_backend_layers: dict[tuple[str, Any], list[str]] = defaultdict(list)
-                attn_backends: dict[tuple[str, Any], tuple[type[Any], Any]] = {}
-                for layer_name in layer_names:
-                    attn_backend = layers[layer_name].get_attn_backend()
-                    kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-                    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                        kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
-                    key = (attn_backend.full_cls_name(), kv_cache_spec)
-                    attn_backends[key] = (attn_backend, kv_cache_spec)
-                    attn_backend_layers[key].append(layer_name)
+        for kv_cache_gid, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
+            draft_layer_names_in_group = set(kv_cache_group_spec.layer_names) & set(self._draft_attn_layer_names)
+            if not draft_layer_names_in_group:
+                continue
 
-                for key, grouped_layer_names in attn_backend_layers.items():
-                    attn_backend, kv_cache_spec = attn_backends[key]
-                    metadata_builder = attn_backend.get_builder_cls()(
+            attention_groups: dict[tuple[str, Any], AttentionGroup] = {}
+            for layer_name in draft_layer_names_in_group:
+                attn_backend = all_attn_layers[layer_name].get_attn_backend()
+                kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
+                key = (attn_backend.full_cls_name(), kv_cache_spec)
+                
+                if key not in attention_groups:
+                    attn_group = AttentionGroup(
+                        attn_backend,
+                        [layer_name],
                         kv_cache_spec,
-                        grouped_layer_names,
-                        self.vllm_config,
-                        self.device,
+                        kv_cache_gid,
                     )
-                    self.draft_attn_groups.append(
-                        AttentionGroup(
-                            attn_backend,
-                            grouped_layer_names,
-                            kv_cache_spec,
-                            kv_cache_gid,
-                            [metadata_builder],
-                        )
-                    )
+                    attn_group.create_metadata_builders(self.vllm_config, self.device)
+                    attention_groups[key] = attn_group
+                else:
+                    attention_groups[key].layer_names.append(layer_name)
 
-            if self.draft_attn_groups:
-                self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
-                self.kernel_block_size = int(self.draft_attn_groups[0].kv_cache_spec.block_size)
-            else:
-                raise RuntimeError(
-                    "DSpark standard-cache path requires registered draft attention "
-                    f"groups. Missing layers: {sorted(draft_attn_layer_names)}"
-                )
+            attention_groups_list.append(attention_groups)
+
+        self.draft_attn_groups = [attention_group for attention_groups in attention_groups_list for attention_group in attention_groups.values()]
+        self.kv_cache_gid = 0
+        if self.draft_attn_groups:
+            self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
+            self.kernel_block_size = int(self.draft_attn_groups[0].kv_cache_spec.block_size)
 
             name_to_gid = {
                 ln: gid
                 for gid, group in enumerate(kv_cache_config.kv_cache_groups)
-                for ln in group.layer_names if ln in self.attn_layer_names
+                for ln in group.layer_names if ln in self._draft_attn_layer_names
             }
-            self._layer_group_idx = [name_to_gid[name] for name in self.attn_layer_names]
+            self._layer_group_idx = [name_to_gid[name] for name in self._draft_attn_layer_names]
+            return
+
+        raise RuntimeError(
+            "DSpark standard-cache path requires registered draft attention "
+            f"groups. Missing layers: {self._draft_attn_layer_names}"
+        )
 
     def set_per_group_attn_metadata(
         self,
@@ -463,43 +504,75 @@ class AscendDSparkProposer(AscendDflashProposer):
             }
             self._context_slots = [self._dspark_context_slot_mappings_by_gid[gidx] for gidx in self._layer_group_idx]
 
-        token_indices_to_sample = torch.arange(
+        # token_indices_to_sample is filled by copy_and_expand_dflash_inputs_py
+        # below (SAMPLE_FROM_ANCHOR=True, anchor included) -- not arange here.
+        token_indices_to_sample = torch.empty(
             num_query_total,
             dtype=torch.int32,
             device=self.device,
         )
 
-        for req_idx in range(batch_size):
-            ctx_start = int(cad.query_start_loc[req_idx].item())
-            ctx_end = int(cad.query_start_loc[req_idx + 1].item())
-            valid_ctx_end = ctx_end
-            if has_num_rejected:
-                assert num_rejected_tokens_gpu is not None
-                valid_ctx_end -= int(num_rejected_tokens_gpu[req_idx].item())
-            last_pos = target_positions[valid_ctx_end - 1]
-            out_start = req_idx * block_size
-            out_end = out_start + block_size
-            self.positions[out_start:out_end] = last_pos + 1 + self.arange_dflash[:block_size]
-            self.input_ids[out_start] = next_token_ids[req_idx]
-            if block_size > 1:
-                self.input_ids[out_start + 1 : out_end] = self.parallel_drafting_token_id
-            token_to_req_indices[out_start:out_end] = req_idx
-
-            draft_attn_groups = getattr(self, "draft_attn_groups", [])
-            if block_tables_by_gid and draft_attn_groups:
-                for attn_group in draft_attn_groups:
-                    gid = attn_group.kv_cache_group_id
-                    gid_block_table = block_tables_by_gid.get(gid)
-                    if gid_block_table is None:
-                        continue
-                    self._slot_mapping_buffer_for_gid(gid, context=False)[out_start:out_end] = (
-                        self._slot_mapping_from_block_table(
-                            self.positions[out_start:out_end],
-                            req_idx,
-                            gid_block_table,
-                            int(attn_group.kv_cache_spec.block_size),
-                        )
-                    )
+        # Query block: reuse the DFlash inputs kernel logic (host-side ref)
+        # per kv-cache-group to fill positions / input_ids / query slot_mapping
+        # / token_indices (SAMPLE_FROM_ANCHOR: anchor at q_idx=0 is sampled too).
+        draft_attn_groups = getattr(self, "draft_attn_groups", [])
+        if block_tables_by_gid and draft_attn_groups:
+            for attn_group in draft_attn_groups:
+                gid = attn_group.kv_cache_group_id
+                gid_block_table = block_tables_by_gid.get(gid)
+                if gid_block_table is None:
+                    continue
+                kv_block_size = int(attn_group.kv_cache_spec.block_size)
+                copy_and_expand_dflash_inputs_py(
+                    # Inputs
+                    next_token_ids=next_token_ids,
+                    target_positions=target_positions,
+                    context_slot_mapping=self._slot_mapping_buffer_for_gid(gid, context=True),
+                    # Outputs
+                    out_input_ids=self.input_ids,
+                    out_context_positions=self._context_positions_buffer,
+                    out_query_positions=self.positions,
+                    out_context_slot_mapping=self._slot_mapping_buffer_for_gid(gid, context=True),
+                    out_query_slot_mapping=self._slot_mapping_buffer_for_gid(gid, context=False),
+                    out_token_indices=token_indices_to_sample,
+                    # Block table
+                    block_table=gid_block_table,
+                    block_table_stride=gid_block_table.stride(0),
+                    # Metadata
+                    query_start_loc=cad.query_start_loc,
+                    seq_lens=cad.seq_lens,
+                    num_rejected_tokens=num_rejected_tokens_gpu,
+                    # Scalars
+                    parallel_drafting_token_id=self.parallel_drafting_token_id,
+                    block_size=kv_block_size,
+                    num_query_per_req=block_size,
+                    num_speculative_tokens=block_size,
+                    total_input_tokens=context_cursor,
+                    batch_size=batch_size,
+                    HAS_NUM_REJECTED=has_num_rejected,
+                    SAMPLE_FROM_ANCHOR=True,
+                )
+        else:
+            # No draft attn groups (profile/dummy without standard path):
+            # fill positions/input_ids only.
+            for req_idx in range(batch_size):
+                ctx_end = int(cad.query_start_loc[req_idx + 1].item())
+                valid_ctx_end = ctx_end
+                if has_num_rejected:
+                    assert num_rejected_tokens_gpu is not None
+                    valid_ctx_end -= int(num_rejected_tokens_gpu[req_idx].item())
+                last_pos = target_positions[valid_ctx_end - 1]
+                out_start = req_idx * block_size
+                out_end = out_start + block_size
+                self.positions[out_start:out_end] = last_pos + 1 + self.arange_dflash[:block_size]
+                self.input_ids[out_start] = next_token_ids[req_idx]
+                if block_size > 1:
+                    self.input_ids[out_start + 1 : out_end] = self.parallel_drafting_token_id
+        # token_to_req: per-token request index (vectorized; equivalent to
+        # token_to_req_indices[req*block:(req+1)*block] = req per req).
+        token_to_req_indices[:num_query_total] = (
+            torch.arange(num_query_total, device=self.device, dtype=torch.int32) // block_size
+        )
 
         effective_seq_lens = cad.seq_lens
         if has_num_rejected:
