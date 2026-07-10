@@ -262,6 +262,10 @@ class AscendDSAPrefillMetadata:
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
     dspark_swa_lens: torch.Tensor | None = None
+    # DSpark non-causal draft: per-token -> request index map, carried from
+    # common_attn_metadata so the eager DSpark attention can read it back from
+    # the per-layer metadata instead of a forward() argument.
+    token_to_req_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -296,6 +300,10 @@ class AscendDSADecodeMetadata:
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
     dspark_swa_lens: torch.Tensor | None = None
+    # DSpark non-causal draft: per-token -> request index map, carried from
+    # common_attn_metadata so the eager DSpark attention can read it back from
+    # the per-layer metadata instead of a forward() argument.
+    token_to_req_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -1410,7 +1418,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             max_seqlen_q=None,  # type: ignore[arg-type]
             attn_mask=None,
             query_start_loc=query_start_loc,
-            query_start_loc_cpu=None,
+            query_start_loc_cpu=query_start_loc_cpu,
             sin=sin[:num_decode_tokens, ...],
             cos=cos[:num_decode_tokens, ...],
             cp_seq_len=None,
@@ -1422,6 +1430,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
             dspark_swa_lens=dspark_swa_lens,
+            token_to_req_indices=getattr(common_attn_metadata, "token_to_req_indices", None),
         )
         return decode_metadata
 
