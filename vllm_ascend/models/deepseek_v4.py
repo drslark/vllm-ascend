@@ -155,42 +155,6 @@ def _apply_dsv4_rope(
     return rotary_emb(x, cos_t, sin_t)
 
 
-def _apply_dsv4_rope_tail(
-    rotary_emb: nn.Module,
-    positions: torch.Tensor,
-    x: torch.Tensor,
-    *,
-    inverse: bool = False,
-) -> torch.Tensor:
-    rotary_dim = rotary_emb.rotary_dim
-    if x.shape[-1] == rotary_dim:
-        return _apply_dsv4_rope(rotary_emb, positions, x, inverse=inverse)
-    x_pass, x_rot = x[..., :-rotary_dim], x[..., -rotary_dim:]
-    x_rot = _apply_dsv4_rope(rotary_emb, positions, x_rot, inverse=inverse)
-    return torch.cat([x_pass, x_rot], dim=-1)
-
-
-def _wo_a_weight_for_eager_projection(
-    wo_a_weight: torch.Tensor,
-    n_local_groups: int,
-    o_lora_rank: int,
-    group_dim: int,
-) -> torch.Tensor:
-    if wo_a_weight.ndim == 3:
-        # Ascend's wo_a loader stores weights as [group, group_dim, rank]
-        # for the main DSA path. Eager projection needs the original
-        # [group, rank, group_dim] layout.
-        return wo_a_weight.transpose(1, 2).contiguous()
-    return wo_a_weight.view(n_local_groups, o_lora_rank, group_dim)
-
-
-def _grouped_wo_a_projection(
-    attn_out: torch.Tensor,
-    wo_a: torch.Tensor,
-) -> torch.Tensor:
-    return torch.matmul(attn_out.transpose(0, 1), wo_a.transpose(1, 2)).transpose(0, 1)
-
-
 def _get_ascend_dsa_backend():
     # Keep this lazy to avoid vLLM model-inspection circular imports.
     from vllm_ascend.attention.dsa_v1 import AscendDSABackend

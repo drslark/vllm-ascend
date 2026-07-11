@@ -22,7 +22,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -40,20 +39,10 @@ from vllm_ascend.models.deepseek_v4 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV4Attention,
     _apply_dsv4_rope,
-    _apply_dsv4_rope_tail,
-    _grouped_wo_a_projection,
     _hc_head_torch,
     _linear_output,
     _make_deepseek_v4_expert_params_mapping,
-    _wo_a_weight_for_eager_projection,
 )
-from vllm_ascend.ops.dspark_attention import (
-    dspark_attention_from_standard_cache,
-    dspark_attention_from_standard_cache_sas,
-)
-
-if typing.TYPE_CHECKING:
-    from vllm_ascend.attention.dsa_v1 import AscendDSADecodeMetadata
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.scale$")
 _LAYER_ID_RE = re.compile(r"model\.layers\.(\d+)\.")
@@ -80,14 +69,22 @@ def _sync_npu_device_for_standard_pta(tensor: torch.Tensor) -> None:
 
 
 class DeepseekV4DSparkAttention(DeepseekV4Attention):
-    """DSpark sliding-window attention with an internal eager context cache."""
+    """DSpark sliding-window attention with an internal eager context cache.
+
+    The draft attention reuses the target model's DSA path
+    (``self.dsa_attn`` -> ``AscendDSAImpl._forward_decode``) and only diverges
+    via the per-layer dspark attention metadata (non-causal visible slot list,
+    a.k.a. ``dspark_swa_indices``) built by the DSA metadata builder. The
+    eager projection of the target's context KV (``precompute_context_kv``) is
+    the only DSpark-specific code that stays here.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
-        config = kwargs["config"]
         super().__init__(*args, **kwargs)
+        # Draft layers are SWA-only (no compressor/indexer); pin both the
+        # module and the DSA wrapper so _build_kv_cache skips the compress path.
         self.compress_ratio = 1
         self.dsa_attn.compress_ratio = 1
-        self.block_size = int(config.dspark_block_size)
 
     def _project_shared_kv(
         self,
@@ -130,109 +127,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         # outside the normal DSA attention op stream choreography.
         _sync_npu_device_for_standard_pta(shared_kv)
 
-    def _standard_query_slot_mapping_from_block_table(
-        self,
-        positions: torch.Tensor,
-        block_table: torch.Tensor,
-        token_to_req_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Map each query token to its paged SWA slot via the block table.
-
-        Padding tokens (``token_to_req_indices < 0``) are never matched to a
-        request and so keep the -1 sentinel, matching the -1 padding already
-        present in the draft query slot mapping built by the proposer.
-        """
-        swa_cache_layer = self.dsa_attn.swa_cache_layer
-        cache_block_size = int(swa_cache_layer.block_size)
-        out = torch.full_like(positions, -1, dtype=torch.int32)
-        pos_long = positions.to(torch.long)
-        if token_to_req_indices.numel() < positions.numel():
-            raise ValueError(
-                "DSpark token_to_req_indices must cover query tokens: "
-                f"token_to_req_indices={token_to_req_indices.numel()}, positions={positions.numel()}"
-            )
-        token_to_req = token_to_req_indices[: positions.numel()].to(
-            device=positions.device,
-            dtype=torch.long,
-        )
-        for req_idx in range(block_table.shape[0]):
-            row_indices = torch.nonzero(token_to_req == req_idx, as_tuple=False).flatten()
-            row_indices = row_indices[row_indices < positions.numel()]
-            if row_indices.numel() == 0:
-                continue
-            block_pos = pos_long.index_select(0, row_indices)
-            block_nums = block_pos // cache_block_size
-            block_offsets = block_pos % cache_block_size
-            block_ids = (
-                block_table[req_idx]
-                .to(device=positions.device, dtype=torch.long)
-                .index_select(
-                    0,
-                    block_nums,
-                )
-            )
-            out[row_indices] = (block_ids * cache_block_size + block_offsets).to(torch.int32)
-        return out
-
-    def _run_standard_dspark_attention(
-        self,
-        q: torch.Tensor,
-        positions: torch.Tensor,
-        slot_mapping: torch.Tensor | None,
-        block_table: torch.Tensor | None,
-        dspark_query_start_loc: torch.Tensor | None = None,
-        dspark_seq_lens: torch.Tensor | None = None,
-        dspark_token_to_req_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        swa_cache_layer = self.dsa_attn.swa_cache_layer
-        swa_kv_cache = getattr(swa_cache_layer, "kv_cache", None)
-        # determine_available_memory runs before the paged swa_kv_cache /
-        # block_table are wired up; in profile/dummy we return a zero tensor so
-        # standard-DSA covers that path. In production these must exist -- a
-        # missing block_table/swa_kv_cache outside profile is a bug.
-        if block_table is None or swa_kv_cache is None:
-            fc = get_forward_context()
-            if fc is not None and getattr(fc, "in_profile_run", False):
-                return torch.zeros_like(q)
-            raise RuntimeError(
-                "DSpark standard-DSA missing block_table or swa_kv_cache in "
-                "production; private cache fallback is disabled."
-            )
-
-        sas_out = dspark_attention_from_standard_cache_sas(
-            q,
-            swa_kv_cache,
-            block_table,
-            positions,
-            slot_mapping,
-            self.attn_sink[: self.n_local_heads],
-            self.block_size,
-            int(self.window_size),
-            int(swa_cache_layer.block_size),
-            float(self.scale),
-            query_start_loc=dspark_query_start_loc,
-            seq_lens=dspark_seq_lens,
-            token_to_req_indices=dspark_token_to_req_indices,
-        )
-        if sas_out is not None:
-            return sas_out
-
-        return dspark_attention_from_standard_cache(
-            q,
-            swa_kv_cache,
-            block_table,
-            positions,
-            slot_mapping,
-            self.attn_sink[: self.n_local_heads],
-            self.block_size,
-            int(self.window_size),
-            int(swa_cache_layer.block_size),
-            float(self.scale),
-            query_start_loc=dspark_query_start_loc,
-            seq_lens=dspark_seq_lens,
-            token_to_req_indices=dspark_token_to_req_indices,
-        )
-
     def precompute_context_kv(
         self,
         main_x: torch.Tensor,
@@ -244,102 +138,18 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         shared_kv = self._project_shared_kv(main_x, positions)
         self._store_standard_swa_kv(shared_kv, context_slot_mapping)
 
-    def _get_dspark_decode_metadata(self) -> "AscendDSADecodeMetadata | None":
-        """Resolve this layer's draft decode metadata from the forward context.
-
-        Mirrors the per-layer lookup in ``vllm.get_attention_context`` but only
-        returns the attention metadata: the DSpark eager attention is invoked
-        directly by the decoder layer rather than through the
-        ``AttentionLayerBase`` machinery, so it must fetch its own metadata.
-        Returns None when no draft metadata was built (profile/dummy runs),
-        letting ``forward`` fall back to the zero-output path.
-        """
-        forward_context = get_forward_context()
-        if forward_context is None:
-            return None
-        attn_metadata = forward_context.attn_metadata
-        # In spec-decode drafting the forward context carries either the
-        # per-layer dict directly or a list whose first element is that dict.
-        if isinstance(attn_metadata, list):
-            attn_metadata = attn_metadata[0] if attn_metadata else None
-        if not isinstance(attn_metadata, dict):
-            return None
-        metadata = attn_metadata.get(self.dsa_attn.swa_cache_layer.prefix)
-        if metadata is None:
-            return None
-        return metadata.decode
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # block_table / query_start_loc / seq_lens / token_to_req_indices are
-        # built into the per-layer attention metadata from common_attn_metadata
-        # by the builder and carried here through the forward context, instead
-        # of being threaded as forward() arguments.
-        decode_meta = self._get_dspark_decode_metadata()
-        if decode_meta is not None:
-            block_table = decode_meta.block_table
-            dspark_query_start_loc = decode_meta.query_start_loc_cpu
-            dspark_seq_lens = decode_meta.seq_lens
-            dspark_token_to_req_indices = decode_meta.token_to_req_indices
-        else:
-            block_table = None
-            dspark_query_start_loc = None
-            dspark_seq_lens = None
-            dspark_token_to_req_indices = None
-
-        shared_kv = self._project_shared_kv(hidden_states, positions)
-        qr = self.q_norm(_linear_output(self.wq_a, hidden_states))
-        q = _linear_output(self.wq_b, qr).view(-1, self.n_local_heads, self.head_dim)
-        q = self.q_norm_without_weight(q)
-        q_nope, q_pe = q.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
-        q_pe = _apply_dsv4_rope(self.rotary_emb, positions, q_pe)
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        if block_table is not None and dspark_token_to_req_indices is not None:
-            standard_slot_mapping = self._standard_query_slot_mapping_from_block_table(
-                positions,
-                block_table,
-                dspark_token_to_req_indices,
-            )
-        else:
-            standard_slot_mapping = None
-        self._store_standard_swa_kv(shared_kv, standard_slot_mapping)
-        standard_attn_out = self._run_standard_dspark_attention(
-            q,
-            positions,
-            standard_slot_mapping,
-            block_table,
-            dspark_query_start_loc,
-            dspark_seq_lens,
-            dspark_token_to_req_indices,
-        )
-        if standard_attn_out is None:
-            raise RuntimeError(
-                "DSpark standard-DSA attention returned None; private cache "
-                "fallback is disabled. standard-DSA has a coverage gap "
-                "(missing block_table or swa_kv_cache)."
-            )
-        attn_out = standard_attn_out
-
-        attn_out = _apply_dsv4_rope_tail(
-            self.rotary_emb,
-            positions,
-            attn_out,
-            inverse=True,
-        )
-        group_dim = self.n_local_heads * self.head_dim // self.n_local_groups
-        attn_out = attn_out.reshape(-1, self.n_local_groups, group_dim)
-        wo_a = _wo_a_weight_for_eager_projection(
-            self.wo_a.weight,
-            self.n_local_groups,
-            self.o_lora_rank,
-            group_dim,
-        )
-        z = _grouped_wo_a_projection(attn_out, wo_a).flatten(1)
-        projected = _linear_output(self.wo_b, z)
-        return projected
+        # Reuse the target model's DSA attention path. The per-layer dspark
+        # attention metadata (block_table / query_start_loc / seq_lens /
+        # token_to_req_indices / dspark_swa_indices) is resolved by the DSA
+        # backend from the forward context (keyed by swa_cache_layer.prefix),
+        # so forward() takes no attention kwargs -- matching
+        # DeepseekV4Attention.forward.
+        return self.dsa_attn(positions, hidden_states)
 
 
 class DeepseekV4DSparkDecoderLayer(DeepseekV2DecoderLayer):

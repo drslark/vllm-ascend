@@ -1160,6 +1160,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSADecodeMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
+        # DSpark drafting operates on the paged SWA cache, whose block size is the
+        # kv_cache_spec block size passed by the proposer (== swa_cache_layer.block_size),
+        # NOT this builder's default MLA block size (128). Honor the kwarg so the
+        # slot_mapping / dspark_swa_indices geometry matches the real cache layout.
+        self.block_size = kwargs.get("block_size", self.block_size)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.decode_threshold
         )
@@ -1784,9 +1789,16 @@ class AscendDSAImpl(DSAAttentionImpl):
         output_padded = output
         forward_context = get_forward_context()
         o_proj_input_shape = (forward_context.num_tokens, self.n_local_heads, self.head_dim)
-        if attn_metadata is None:
-            # Profiling run: run o_proj on zero input so HCCL collectives are
-            # captured by the ACL graph.  Non-OTP just zeros the output.
+        # DSpark draft profile_run builds per-layer attention metadata before the
+        # paged SWA KV cache is allocated (determine_available_memory), so the
+        # metadata is present but swa_kv_cache is still the empty placeholder.
+        # Treat that like the profiling-run branch: emit zeros (and run o_proj on
+        # a zero input when OTP is enabled so HCCL collectives are captured).
+        swa_kv_cache = kv_cache[1] if kv_cache is not None else None
+        swa_kv_cache_unavailable = swa_kv_cache is None or (
+            isinstance(swa_kv_cache, torch.Tensor) and swa_kv_cache.numel() == 0
+        )
+        if attn_metadata is None or swa_kv_cache_unavailable:
             if oproj_tp_enable():
                 o_proj_input = torch.zeros(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
                 self._forward_o_proj(o_proj_input, output)
