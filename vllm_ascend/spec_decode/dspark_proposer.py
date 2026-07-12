@@ -180,9 +180,9 @@ class AscendDSparkProposer(AscendDflashProposer):
         # per-gid block_table (current batch)
         self._dspark_block_tables_by_gid: dict[int, torch.Tensor] = {}
         # per-gid block_table from runner set_per_group_attn_metadata
-        self._dspark_per_group_block_tables: dict[int, torch.Tensor] = {}
+        self._per_group_block_tables: dict[int, torch.Tensor] = {}
         # per-gid slot_mapping from runner set_per_group_attn_metadata
-        self._dspark_per_group_slot_mappings: dict[int, torch.Tensor] = {}
+        self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
         # per-gid query slot_mapping buffer (allocated on demand)
         self._dspark_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         # per-gid context slot_mapping buffer (allocated on demand)
@@ -218,18 +218,19 @@ class AscendDSparkProposer(AscendDflashProposer):
                 continue
 
             attention_groups: dict[tuple[str, Any], AttentionGroup] = {}
+            # iterate in a way like vllm's llm_base_proposer
             for layer_name in draft_layer_names_in_group:
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
-                kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                    kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
-                key = (attn_backend.full_cls_name(), kv_cache_spec)
+                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
                 
                 if key not in attention_groups:
                     attn_group = AttentionGroup(
                         attn_backend,
                         [layer_name],
-                        kv_cache_spec,
+                        layer_kv_cache_spec,
                         kv_cache_gid,
                     )
                     attn_group.create_metadata_builders(self.vllm_config, self.device)
@@ -264,8 +265,8 @@ class AscendDSparkProposer(AscendDflashProposer):
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        self._dspark_per_group_block_tables[gid] = block_table
-        self._dspark_per_group_slot_mappings[gid] = slot_mapping
+        self._per_group_block_tables[gid] = block_table
+        self._per_group_slot_mappings[gid] = slot_mapping
 
     def _slot_mapping_buffer_for_gid(self, gid: int, *, context: bool) -> torch.Tensor:
         if gid == getattr(self, "kv_cache_gid", 0):
@@ -351,7 +352,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         batch_size: int,
         gid: int,
     ) -> torch.Tensor | None:
-        block_table = getattr(self, "_dspark_per_group_block_tables", {}).get(gid)
+        block_table = getattr(self, "_per_group_block_tables", {}).get(gid)
         input_batch = getattr(getattr(self, "runner", None), "input_batch", None)
         block_tables = getattr(input_batch, "block_table", None)
         if block_table is None and block_tables is not None:
@@ -390,20 +391,6 @@ class AscendDSparkProposer(AscendDflashProposer):
             if block_table is not None:
                 by_gid[gid] = block_table
         return by_gid
-
-    def _slot_mapping_from_block_table(
-        self,
-        positions: torch.Tensor,
-        req_idx: int,
-        block_table: torch.Tensor,
-        block_size: int | None = None,
-    ) -> torch.Tensor:
-        if block_size is None:
-            block_size = self.kernel_block_size
-        block_nums = positions // block_size
-        block_offsets = positions % block_size
-        block_ids = block_table[req_idx].index_select(0, block_nums.long())
-        return block_ids.to(torch.int32) * block_size + block_offsets
 
     def set_inputs_first_pass(
         self,
@@ -450,39 +437,8 @@ class AscendDSparkProposer(AscendDflashProposer):
         if batch_size < self._markov_anchor_tokens.shape[0]:
             self._markov_anchor_tokens[batch_size:].fill_(0)
 
-        context_cursor = 0
-        for req_idx in range(batch_size):
-            ctx_start = int(cad.query_start_loc[req_idx].item())
-            ctx_end = int(cad.query_start_loc[req_idx + 1].item())
-            ctx_len = ctx_end - ctx_start
-            if ctx_len == 0:
-                continue
-            out_end = context_cursor + ctx_len
-            self._dflash_hidden_states[context_cursor:out_end] = target_hidden_states[ctx_start:ctx_end]
-            self._context_positions_buffer[context_cursor:out_end] = target_positions[ctx_start:ctx_end]
-            draft_attn_groups = getattr(self, "draft_attn_groups", [])
-            if block_tables_by_gid and draft_attn_groups:
-                for attn_group in draft_attn_groups:
-                    gid = attn_group.kv_cache_group_id
-                    gid_block_table = block_tables_by_gid.get(gid)
-                    if gid_block_table is None:
-                        continue
-                    self._slot_mapping_buffer_for_gid(gid, context=True)[context_cursor:out_end] = (
-                        self._slot_mapping_from_block_table(
-                            target_positions[ctx_start:ctx_end],
-                            req_idx,
-                            gid_block_table,
-                            int(attn_group.kv_cache_spec.block_size),
-                        )
-                    )
-            context_cursor = out_end
-        self._dflash_num_context = context_cursor
-        if block_tables_by_gid:
-            self._dspark_context_slot_mappings_by_gid = {
-                gid: self._slot_mapping_buffer_for_gid(gid, context=True)[:context_cursor]
-                for gid in block_tables_by_gid
-            }
-            self._context_slots = [self._dspark_context_slot_mappings_by_gid[gidx] for gidx in self._layer_group_idx]
+        self._dflash_num_context = cad.query_start_loc_cpu[batch_size]
+        self._dflash_hidden_states[:self._dflash_num_context] = target_hidden_states[:self._dflash_num_context]
 
         # token_indices_to_sample is filled by copy_and_expand_dflash_inputs_py
         # below (SAMPLE_FROM_ANCHOR=True, anchor included) -- not arange here.
@@ -507,7 +463,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                     # Inputs
                     next_token_ids=next_token_ids,
                     target_positions=target_positions,
-                    context_slot_mapping=self._slot_mapping_buffer_for_gid(gid, context=True),
+                    context_slot_mapping=self._per_group_slot_mappings[gid],
                     # Outputs
                     out_input_ids=self.input_ids,
                     out_context_positions=self._context_positions_buffer,
@@ -527,7 +483,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                     block_size=kv_block_size,
                     num_query_per_req=block_size,
                     num_speculative_tokens=block_size,
-                    total_input_tokens=context_cursor,
+                    total_input_tokens=self._dflash_num_context,
                     batch_size=batch_size,
                     HAS_NUM_REJECTED=has_num_rejected,
                     SAMPLE_FROM_ANCHOR=True,
@@ -548,6 +504,14 @@ class AscendDSparkProposer(AscendDflashProposer):
                 self.input_ids[out_start] = next_token_ids[req_idx]
                 if block_size > 1:
                     self.input_ids[out_start + 1 : out_end] = self.parallel_drafting_token_id
+
+        if block_tables_by_gid:
+            self._dspark_context_slot_mappings_by_gid = {
+                gid: self._slot_mapping_buffer_for_gid(gid, context=True)[:self._dflash_num_context]
+                for gid in block_tables_by_gid
+            }
+            self._context_slots = [self._dspark_context_slot_mappings_by_gid[gidx] for gidx in self._layer_group_idx]
+
         # token_to_req: per-token request index (vectorized; equivalent to
         # token_to_req_indices[req*block:(req+1)*block] = req per req).
         token_to_req_indices[:num_query_total] = (
