@@ -74,7 +74,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                 dtype=self.dtype,
                 device=self.device,
             )
-        self.method = "dflash"
+        self.method = "dspark"
         self.parallel_drafting = True
         self.block_size = self.num_speculative_tokens
         # Per-request extra KV slots = num_speculative_tokens (one slot per
