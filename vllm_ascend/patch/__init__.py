@@ -1139,25 +1139,7 @@
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
 #
-# ** 31. File: worker/patch_qwen3_dspark.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer`
-#    Why:
-#       The config.json of the open-source dspark contains two types of
-#       "mask_token_id" with different variable names and indentation.
-#       Currently, the vllm community has only added support for deepseek,
-#       but not for the qwen/glm series. In model_runner_v1, since the
-#       initialization of vllm/eagle_proposer is performed first, followed
-#       by the initialization of vllm-ascend/llm_base_proposer, this
-#       modification cannot be implemented in vllm-ascend/llm_base_proposer.
-#    How:
-#       Override the `SpecDecodeBaseProposer._init_parallel_drafting_params`
-#       method and add the reading of the `dspark config.json` for `qwen/glm`
-#    Future Plan:
-#       Remove this patch once vllm-ascend fully supports the v2 model
-#       runner.
-#
-# ** 32. File: worker/patch_step3p5.py**
+# ** 31. File: worker/patch_step3p5.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.step3p5.Step3p5Attention.forward`
 #    Why:
@@ -1174,7 +1156,7 @@
 #       Remove this patch once torch.compile fully supports matching pattern from
 #       op's params.
 #
-# ** 33. File: hunyuan_vl_processor_compat.py**
+# ** 32. File: hunyuan_vl_processor_compat.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.hunyuan_vision.HunYuanVLProcessingInfo.get_hf_processor`
 #      and the vLLM processor lazy registry
