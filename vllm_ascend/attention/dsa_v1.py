@@ -18,10 +18,17 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    maybe_save_kv_layer_to_connector,
+    notify_kv_cache_written,
+    split_decodes_and_prefills,
+    wait_for_kv_layer_from_connector,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_otp_group
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
@@ -1786,6 +1793,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
+        wait_for_kv_layer_from_connector(layer_name)
         if has_prefill:
             assert attn_metadata[0].prefill is not None
             output_prefill = self._forward_prefill(
@@ -1818,6 +1826,8 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # o
         self._forward_o_proj(o_proj_input, output)
+
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
 
@@ -2037,6 +2047,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         if self.compress_ratio <= 1:
             if swa_prefill_metadata.dspark_swa_indices is not None:
                 extra_attn_kwargs["ori_sparse_indices"] = swa_prefill_metadata.dspark_swa_indices
+            notify_kv_cache_written(layer_name)
+            record_attention_compute_start()
             return attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -2173,6 +2185,9 @@ class AscendDSAImpl(DSAAttentionImpl):
 
             if self.compress_ratio == 4 and self.use_index_cache:
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=prefill_offset)
+
+            notify_kv_cache_written(layer_name)
+            record_attention_compute_start()
 
             if self.compress_ratio == 4:
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
@@ -2469,6 +2484,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             if self.compress_ratio == 4 and self.use_index_cache:
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=0)
 
+        notify_kv_cache_written(layer_name)
+        record_attention_compute_start()
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
 
