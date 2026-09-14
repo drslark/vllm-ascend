@@ -376,43 +376,40 @@ def test_runner_reduction_contract(monkeypatch, moe_comm_type, is_sequence_paral
 
 
 @pytest.mark.parametrize(
-    ("is_sequence_parallel", "output_is_reduced", "should_reduce"),
+    ("is_sequence_parallel", "calls_runtime_reduction"),
     [
-        (False, False, True),
-        (False, True, False),
-        (True, False, False),
-        (True, True, False),
+        (False, True),
+        (True, False),
     ],
 )
-def test_final_output_never_all_reduces_sequence_shards(
+def test_final_output_delegates_non_sp_reduction_to_runtime_op(
     monkeypatch,
     is_sequence_parallel,
-    output_is_reduced,
-    should_reduce,
+    calls_runtime_reduction,
 ):
     runner = AscendMoERunner.__new__(AscendMoERunner)
     runner.moe_config = SimpleNamespace(is_sequence_parallel=is_sequence_parallel)
     states = torch.ones(2, 4)
     reduced_states = states + 1
-    all_reduce = MagicMock(return_value=reduced_states)
+    maybe_all_reduce = MagicMock(return_value=reduced_states)
     monkeypatch.setattr(
-        fused_moe_module,
-        "tensor_model_parallel_all_reduce",
-        all_reduce,
+        torch.ops.vllm,
+        "maybe_all_reduce_tensor_model_parallel",
+        maybe_all_reduce,
     )
 
     result = runner._maybe_reduce_final_output(
         states,
         trunc_size=None,
-        output_is_reduced=output_is_reduced,
+        output_is_reduced=False,
     )
 
-    if should_reduce:
+    if calls_runtime_reduction:
         assert result is reduced_states
-        all_reduce.assert_called_once_with(states)
+        maybe_all_reduce.assert_called_once_with(states)
     else:
         assert result is states
-        all_reduce.assert_not_called()
+        maybe_all_reduce.assert_not_called()
 
 
 @pytest.mark.parametrize(

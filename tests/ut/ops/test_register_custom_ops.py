@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops import register_custom_ops as custom_ops
 
 
@@ -78,6 +80,40 @@ def test_sp_ep_fake_shapes_follow_uneven_local_chunks(monkeypatch):
 
     assert gathered.shape == (8, 4)
     assert reduced.shape == (3, 4)
+
+
+def test_maybe_all_reduce_tracks_runtime_moe_comm_type(monkeypatch):
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    context = SimpleNamespace(moe_comm_type=MoECommType.ALLGATHER)
+    monkeypatch.setattr(custom_ops, "_EXTRA_CTX", context)
+    all_reduce = MagicMock(side_effect=lambda states: states * 4)
+    monkeypatch.setattr(custom_ops, "tensor_model_parallel_all_reduce", all_reduce)
+    states = torch.ones(2, 4)
+
+    library = torch.library.Library("vllm", "IMPL", "CPU")
+    library.impl(
+        "maybe_all_reduce_tensor_model_parallel",
+        custom_ops._maybe_all_reduce_tensor_model_parallel_impl,
+    )
+    try:
+        graph = make_fx(
+            lambda x: torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(x)
+        )(states)
+
+        context.moe_comm_type = MoECommType.ALLGATHER
+        torch.testing.assert_close(graph(states), states * 4)
+
+        context.moe_comm_type = MoECommType.MC2
+        torch.testing.assert_close(graph(states), states)
+
+        assert any(
+            node.target
+            == torch.ops.vllm.maybe_all_reduce_tensor_model_parallel.default
+            for node in graph.graph.nodes
+        )
+    finally:
+        library._destroy()
 
 
 def test_rope_fake_uses_requested_output_dtype():

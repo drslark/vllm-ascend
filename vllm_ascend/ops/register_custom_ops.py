@@ -8,7 +8,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.utils import is_vl_model
@@ -110,6 +110,19 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     return ep_group.reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
 
 
+def _maybe_all_reduce_tensor_model_parallel_impl(
+    final_hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Keep the MoE communication-dependent reduction decision at runtime."""
+    if _EXTRA_CTX.moe_comm_type in {
+        MoECommType.ALLTOALL,
+        MoECommType.MC2,
+        MoECommType.FUSED_MC2,
+    }:
+        return final_hidden_states
+    return tensor_model_parallel_all_reduce(final_hidden_states)
+
+
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor) -> torch.Tensor:
     forward_context = get_forward_context()
     ep_group = get_ep_group()
@@ -190,6 +203,14 @@ direct_register_custom_op(
     op_name="maybe_pad_and_reduce",
     op_func=_maybe_pad_and_reduce_impl,
     fake_impl=_maybe_pad_and_reduce_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="maybe_all_reduce_tensor_model_parallel",
+    op_func=_maybe_all_reduce_tensor_model_parallel_impl,
+    fake_impl=lambda x: x,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

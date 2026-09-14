@@ -255,13 +255,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         trunc_size: int | None,
         output_is_reduced: bool | None = None,
     ) -> torch.Tensor:
-        if output_is_reduced is None:
-            output_is_reduced = self._fused_output_is_reduced
-        if not output_is_reduced and not self.moe_config.is_sequence_parallel:
-            # Use the normal TP collective when the upstream reduction
-            # contract requires it. Sequence-parallel outputs are token
-            # shards, so reducing them position-wise would corrupt the result.
-            states = tensor_model_parallel_all_reduce(states)
+        # The custom op re-evaluates the current MoE communication method when
+        # the graph executes. In particular, an ALLGATHER capture can be reused
+        # by an MC2 batch without replaying the captured final all-reduce.
+        if not self.moe_config.is_sequence_parallel:
+            states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
         if trunc_size is not None and trunc_size > 0:
             return states[..., :trunc_size]
         return states
