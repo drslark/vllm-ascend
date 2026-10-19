@@ -577,8 +577,7 @@ class AscendConfig:
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     kv_pool_range_debug: bool = False
-    # Experimental GLM MTP state recovery; execution constraints are
-    # checked by use_glm_recoverssm before allocating recurrent-state caches.
+    # Experimental GLM KDA state recovery; disabled by default.
     kda_recoverssm: StrictBool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False

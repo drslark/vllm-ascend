@@ -363,13 +363,7 @@ def test_host_backend_selects_recoverssm_only_for_opted_in_glm(model_type, enabl
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type)),
         additional_config={"kda_recoverssm": enabled},
-        num_speculative_tokens=5,
-        speculative_config=SimpleNamespace(method="mtp"),
-        cache_config=SimpleNamespace(mamba_cache_mode="none", enable_prefix_caching=False, use_kda_recoverssm=False),
-        parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
-        ),
-        kv_transfer_config=None,
+        cache_config=SimpleNamespace(use_kda_recoverssm=False),
     )
     expected = AscendKDARecoverSSMMetadataBuilder if recover else AscendGDNHostMetadataBuilder
     with set_current_vllm_config(config):
