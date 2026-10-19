@@ -337,12 +337,15 @@ def test_kimi_chunk_metadata_uses_linear_attention_head_count() -> None:
 
 
 def test_ascend_gdn_attention_uses_ascend_backend():
-    from vllm_ascend.models.glm5next.kda import Glm5NextLinearAttention
+    from vllm_ascend.models.glm5next.kda import AscendKDARecoverSSMBackend, Glm5NextLinearAttention
     from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention
 
     assert AscendGatedDeltaNetAttention.get_attn_backend(object()) is AscendGDNFusedAttentionBackend
     assert AscendKimiK3DeltaAttention.get_attn_backend(object()) is AscendGDNHostMetadataBackend
-    assert Glm5NextLinearAttention.get_attn_backend(object()) is AscendGDNHostMetadataBackend
+    assert (
+        Glm5NextLinearAttention.get_attn_backend(SimpleNamespace(use_recoverssm=False)) is AscendGDNHostMetadataBackend
+    )
+    assert Glm5NextLinearAttention.get_attn_backend(SimpleNamespace(use_recoverssm=True)) is AscendKDARecoverSSMBackend
     assert Glm5NextLinearAttention.use_contiguous_conv_indices
     assert AscendGDNAttentionBackend.get_builder_cls() is AscendGDNAttentionMetadataBuilder
 
