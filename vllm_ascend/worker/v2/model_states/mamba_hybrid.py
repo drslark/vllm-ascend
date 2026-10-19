@@ -38,7 +38,7 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.models.glm5next.recoverssm_config import init_glm_recoverssm
+from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -80,8 +80,12 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     """
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
-        if vllm_config.model_config.hf_text_config.model_type in ("glm5_next", "glm5_next_text"):
-            init_glm_recoverssm(vllm_config)
+        if (
+            vllm_config.model_config.hf_text_config.model_type in ("glm5_next", "glm5_next_text")
+            and use_glm_recoverssm(vllm_config)
+        ):
+            # Target/draft config construction can reset this upstream flag.
+            vllm_config.cache_config.use_kda_recoverssm = True
         super().__init__(vllm_config, *args, **kwargs)
         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None

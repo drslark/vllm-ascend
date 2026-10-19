@@ -9,9 +9,7 @@ def use_glm_recoverssm(vllm_config: VllmConfig) -> bool:
     return vllm_config.additional_config.get("kda_recoverssm", False)
 
 
-def init_glm_recoverssm(vllm_config: VllmConfig) -> None:
-    if not use_glm_recoverssm(vllm_config):
-        return
+def validate_glm_recoverssm(vllm_config: VllmConfig) -> None:
     if vllm_config.speculative_config is None:
         raise ValueError("GLM RecoverSSM requires speculative decoding")
     if vllm_config.speculative_config.method not in ("mtp", "deepseek_mtp"):
@@ -26,5 +24,3 @@ def init_glm_recoverssm(vllm_config: VllmConfig) -> None:
         raise ValueError("GLM RecoverSSM currently requires DCP=1")
     if vllm_config.kv_transfer_config is not None:
         raise ValueError("GLM RecoverSSM does not yet support KV transfer")
-    # Model state is initialized after target/draft configuration construction.
-    cache.use_kda_recoverssm = True

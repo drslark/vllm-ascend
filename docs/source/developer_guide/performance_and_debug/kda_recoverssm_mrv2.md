@@ -3,12 +3,14 @@
 Enable this experimental path with `--additional-config '{"kda_recoverssm": true}'`
 alongside speculative decoding. The default remains the native AscendC KDA path.
 
-GLM model-state initialization requires MTP (`mtp` or `deepseek_mtp`),
+Service configuration initialization requires MTP (`mtp` or `deepseek_mtp`),
 PP/PCP/DCP=1, `--no-enable-prefix-caching`, Mamba cache mode `none`, and no KV
-transfer. These constraints are checked once before activating the shared cache
-contract and constructing the upstream state. Initialization runs after
-target/draft configuration construction, which can reset the upstream cache
-flag. The enable helper and backend selection only read the explicit switch.
+transfer. `AscendConfig.derive_and_validate()` checks these constraints when
+initializing the service configuration. Model-state initialization only activates
+the shared cache contract before constructing the upstream state, after
+target/draft configuration construction can reset the upstream cache flag.
+It does not revalidate configuration. The enable helper and backend selection
+only read the explicit switch.
 Boolean validation stays in `AscendConfig`; speculative-token validity stays
 in upstream configuration validation.
 

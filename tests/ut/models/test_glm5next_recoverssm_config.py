@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.ascend_config import AscendConfig, SparseKVOffloadConfig
-from vllm_ascend.models.glm5next.recoverssm_config import init_glm_recoverssm, use_glm_recoverssm
+from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm, validate_glm_recoverssm
 
 
 def make_config():
@@ -30,23 +30,23 @@ def test_default_does_not_change_native_cache_contract():
     config = make_config()
     config.additional_config = {}
     assert not use_glm_recoverssm(config)
-    init_glm_recoverssm(config)
     assert not config.cache_config.use_kda_recoverssm
 
 
-def test_enabled_activates_upstream_cache_and_worker_contract():
+def test_configuration_validation_leaves_worker_activation_to_state_initialization():
     config = make_config()
     assert use_glm_recoverssm(config)
     assert not config.cache_config.use_kda_recoverssm
-    init_glm_recoverssm(config)
-    assert config.cache_config.use_kda_recoverssm
+    validate_glm_recoverssm(config)
+    assert not config.cache_config.use_kda_recoverssm
 
 
 def test_initialization_requires_speculative_decoding():
     config = make_config()
     config.speculative_config = None
+    ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kda_recoverssm=True)
     with pytest.raises(ValueError, match="requires speculative decoding"):
-        init_glm_recoverssm(config)
+        ascend_config.derive_and_validate(config)
     assert not config.cache_config.use_kda_recoverssm
 
 
@@ -65,6 +65,7 @@ def test_initialization_requires_speculative_decoding():
 def test_initialization_rejects_unsupported_execution(section, field, value, message):
     config = make_config()
     setattr(getattr(config, section) if section else config, field, value)
+    ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kda_recoverssm=True)
     with pytest.raises(ValueError, match=message):
-        init_glm_recoverssm(config)
+        ascend_config.derive_and_validate(config)
     assert not config.cache_config.use_kda_recoverssm
