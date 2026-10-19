@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit, default-off GLM RecoverSSM configuration for MRV2."""
+"""Explicit, default-off GLM KDA RecoverSSM configuration."""
 
 from vllm.config import VllmConfig
 
@@ -11,8 +11,6 @@ def use_glm_recoverssm(vllm_config: VllmConfig) -> bool:
         raise ValueError("additional_config.kda_recoverssm must be a boolean")
     if not enabled:
         return False
-    if not vllm_config.use_v2_model_runner:
-        raise ValueError("GLM RecoverSSM requires Model Runner V2")
     if vllm_config.num_speculative_tokens <= 0:
         raise ValueError("GLM RecoverSSM requires speculative decoding")
     if vllm_config.speculative_config.method not in ("mtp", "deepseek_mtp"):

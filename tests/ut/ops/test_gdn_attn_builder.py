@@ -363,7 +363,6 @@ def test_host_backend_selects_recoverssm_only_for_opted_in_glm(model_type, enabl
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type)),
         additional_config={"kda_recoverssm": enabled},
-        use_v2_model_runner=True,
         num_speculative_tokens=5,
         speculative_config=SimpleNamespace(method="mtp"),
         cache_config=SimpleNamespace(mamba_cache_mode="none", enable_prefix_caching=False, use_kda_recoverssm=False),

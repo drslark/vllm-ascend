@@ -11,7 +11,6 @@ from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
 def make_config():
     return SimpleNamespace(
         additional_config={"kda_recoverssm": True},
-        use_v2_model_runner=True,
         num_speculative_tokens=5,
         speculative_config=SimpleNamespace(method="mtp"),
         cache_config=SimpleNamespace(mamba_cache_mode="none", enable_prefix_caching=False, use_kda_recoverssm=False),
@@ -44,7 +43,6 @@ def test_enabled_activates_upstream_cache_and_worker_contract():
 @pytest.mark.parametrize(
     "path,value",
     [
-        ("use_v2_model_runner", False),
         ("num_speculative_tokens", 0),
         ("speculative_config.method", "eagle3"),
         ("cache_config.mamba_cache_mode", "align"),

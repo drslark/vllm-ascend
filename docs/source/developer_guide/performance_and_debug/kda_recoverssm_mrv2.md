@@ -1,10 +1,14 @@
-# Experimental GLM KDA RecoverSSM on Model Runner V2
+# Experimental GLM KDA RecoverSSM
 
 Enable this experimental path with `--additional-config '{"kda_recoverssm": true}'`
-alongside MTP speculative decoding. Use Model Runner V2, PP/PCP/DCP=1,
+alongside MTP speculative decoding, with PP/PCP/DCP=1,
 `--no-enable-prefix-caching`, and Mamba cache mode `none`. KV transfer and
 aligned prefix caching are currently rejected. The default remains the native
 AscendC KDA path.
+
+Existing end-to-end validation used Model Runner V2. Removing the runner-version
+configuration gate does not establish support for other runners' post-sampling
+state-commit paths; those paths have not been validated.
 
 This implementation reuses the verified vLLM revision's RecoverSSM request
 partitioning, accepted-count mapping, and post-sampling coordination. The
