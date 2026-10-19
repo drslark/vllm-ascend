@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Reuse upstream RecoverSSM request/commit metadata with AscendC descriptors."""
 
+from contextlib import contextmanager
 from dataclasses import replace
 
 import torch
@@ -24,12 +25,17 @@ from vllm_ascend.ops.triton.kda.recoverssm import KDARecoverSSMCommitContext
 class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # Upstream staging checks is_cuda. Use persistent NPU buffers below;
-        # the parent still owns request partitioning and accepted-count mapping.
+    @contextmanager
+    def _disable_upstream_graph_staging(self):
+        # Only the parent build uses CUDA-specific staging. Restore the real
+        # graph mode before preparing persistent NPU buffers, even on failure.
         self._ascend_full_graph = self.use_full_cuda_graph
         self.use_full_cuda_graph = False
+        try:
+            yield
+        finally:
+            self.use_full_cuda_graph = self._ascend_full_graph
+            del self._ascend_full_graph
 
     def _get_recoverssm_context(self):
         if self.recoverssm_context is None:
@@ -64,7 +70,8 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
             if num_decode_draft_tokens_cpu is not None:
                 num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu.clone()
                 num_decode_draft_tokens_cpu[num_actual_reqs:] = -1
-        metadata = super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
+        with self._disable_upstream_graph_staging():
+            metadata = super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
         metadata.non_spec_prefill_metadata = None
         metadata.non_spec_decode_metadata = None
         metadata.spec_decode_metadata = None
@@ -127,7 +134,7 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
         return torch.cat((torch.zeros(1, dtype=lengths.dtype), non_spec_lengths.cumsum(0)))
 
     def _stage_spec(self, metadata, batch_size):
-        if not self._ascend_full_graph or metadata.num_prefills or metadata.num_decodes:
+        if not self.use_full_cuda_graph or metadata.num_prefills or metadata.num_decodes:
             return
         count = metadata.num_spec_decodes
         states = self.spec_state_indices_tensor[:batch_size]

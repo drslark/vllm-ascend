@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.models.kimi_k3.nvidia.kda_metadata import KDARecoverSSMCommitMetadata, KimiK3KDAMetadataBuilder
 
@@ -10,12 +11,14 @@ from vllm_ascend.models.glm5next.recoverssm_metadata import AscendKDARecoverSSMM
 
 def test_graph_padding_is_excluded_from_sampler_commit_rows(monkeypatch):
     builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
+    builder.use_full_cuda_graph = True
     starts = torch.tensor([0, 6, 12, 18, 24], dtype=torch.int32)
     drafts = torch.full((4,), 5, dtype=torch.int32)
     m = SimpleNamespace(num_reqs=4, num_actual_tokens=24, query_start_loc_cpu=starts, query_start_loc=starts)
     m.replace = lambda **updates: SimpleNamespace(**(vars(m) | updates))
 
     def parent_build(self, prefix, common, accepted, draft_counts, fast_build):
+        assert self.use_full_cuda_graph is False
         assert common.query_start_loc_cpu.tolist() == common.query_start_loc.tolist() == [0, 6, 12, 12, 12]
         assert common.num_actual_tokens == 12
         assert draft_counts.tolist() == [5, 5, -1, -1]
@@ -23,13 +26,14 @@ def test_graph_padding_is_excluded_from_sampler_commit_rows(monkeypatch):
 
     monkeypatch.setattr(KimiK3KDAMetadataBuilder, "build", parent_build)
     builder.build(0, m, num_decode_draft_tokens_cpu=drafts, num_actual_reqs=2)
+    assert builder.use_full_cuda_graph is True
     assert drafts.tolist() == [5, 5, 5, 5]
     assert starts.tolist() == [0, 6, 12, 18, 24]
 
 
 def test_graph_staging_reuses_addresses_and_clears_prior_rows():
     builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
-    builder._ascend_full_graph = True
+    builder.use_full_cuda_graph = True
     builder.spec_state_indices_tensor = torch.full((4, 1), 99, dtype=torch.int32)
     builder.spec_query_start_loc = torch.full((5,), 99, dtype=torch.int32)
     builder.num_accepted_tokens = torch.full((4,), 99, dtype=torch.int32)
@@ -58,6 +62,31 @@ def test_graph_staging_reuses_addresses_and_clears_prior_rows():
             t.data_ptr()
             for t in (metadata.spec_state_indices_tensor, metadata.spec_query_start_loc, metadata.num_accepted_tokens)
         ]
+
+
+@pytest.mark.parametrize("full_graph", [False, True])
+@pytest.mark.parametrize("parent_raises", [False, True])
+def test_parent_build_graph_mode_is_scoped_and_restored(monkeypatch, full_graph, parent_raises):
+    builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
+    builder.use_full_cuda_graph = full_graph
+    assert not hasattr(builder, "_ascend_full_graph")
+    common = SimpleNamespace()
+
+    def parent_build(self, *args):
+        assert self.use_full_cuda_graph is False
+        assert self._ascend_full_graph is full_graph
+        if parent_raises:
+            raise RuntimeError("parent metadata build failed")
+        return SimpleNamespace(num_spec_decodes=0, num_prefills=0, num_decodes=0)
+
+    monkeypatch.setattr(KimiK3KDAMetadataBuilder, "build", parent_build)
+    if parent_raises:
+        with pytest.raises(RuntimeError, match="parent metadata build failed"):
+            builder.build(0, common)
+    else:
+        builder.build(0, common)
+    assert builder.use_full_cuda_graph is full_graph
+    assert not hasattr(builder, "_ascend_full_graph")
 
 
 def test_mixed_prefill_cpu_offsets_match_upstream_decode_partition():
