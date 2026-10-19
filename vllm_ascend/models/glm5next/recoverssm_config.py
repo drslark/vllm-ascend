@@ -14,5 +14,17 @@ def init_glm_recoverssm(vllm_config: VllmConfig) -> None:
         return
     if vllm_config.speculative_config is None:
         raise ValueError("GLM RecoverSSM requires speculative decoding")
+    if vllm_config.speculative_config.method not in ("mtp", "deepseek_mtp"):
+        raise ValueError("GLM RecoverSSM currently requires MTP")
+    cache = vllm_config.cache_config
+    if cache.mamba_cache_mode != "none" or cache.enable_prefix_caching:
+        raise ValueError("GLM RecoverSSM currently requires Mamba cache mode none and prefix caching disabled")
+    parallel = vllm_config.parallel_config
+    if parallel.pipeline_parallel_size != 1 or parallel.prefill_context_parallel_size != 1:
+        raise ValueError("GLM RecoverSSM currently requires PP=1 and PCP=1")
+    if parallel.decode_context_parallel_size != 1:
+        raise ValueError("GLM RecoverSSM currently requires DCP=1")
+    if vllm_config.kv_transfer_config is not None:
+        raise ValueError("GLM RecoverSSM does not yet support KV transfer")
     # Model state is initialized after target/draft configuration construction.
-    vllm_config.cache_config.use_kda_recoverssm = True
+    cache.use_kda_recoverssm = True

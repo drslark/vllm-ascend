@@ -3,15 +3,17 @@
 Enable this experimental path with `--additional-config '{"kda_recoverssm": true}'`
 alongside speculative decoding. The default remains the native AscendC KDA path.
 
-The measured configuration used MTP with five draft tokens, PP/PCP/DCP=1,
-`--no-enable-prefix-caching`, Mamba cache mode `none`, and no KV transfer.
-These are the settings covered by the retained validation evidence; other
-combinations have not been validated. The enable helper and backend selection
-only read the explicit switch. GLM model-state initialization checks once that
-speculative decoding is enabled and activates the shared cache contract before
-constructing the upstream state. It runs after target/draft configuration
-construction, which can reset the upstream cache flag. Other execution options
-are not revalidated here.
+GLM model-state initialization requires MTP (`mtp` or `deepseek_mtp`),
+PP/PCP/DCP=1, `--no-enable-prefix-caching`, Mamba cache mode `none`, and no KV
+transfer. These constraints are checked once before activating the shared cache
+contract and constructing the upstream state. Initialization runs after
+target/draft configuration construction, which can reset the upstream cache
+flag. The enable helper and backend selection only read the explicit switch.
+Boolean validation stays in `AscendConfig`; speculative-token validity stays
+in upstream configuration validation.
+
+The retained hardware evidence used five draft tokens with the settings above.
+Other execution combinations have not been validated.
 
 Existing end-to-end validation used Model Runner V2. Removing the runner-version
 configuration gate does not establish support for other runners' post-sampling
