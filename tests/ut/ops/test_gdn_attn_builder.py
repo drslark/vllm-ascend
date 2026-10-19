@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -337,7 +338,7 @@ def test_kimi_chunk_metadata_uses_linear_attention_head_count() -> None:
 
 
 def test_ascend_gdn_attention_uses_ascend_backend():
-    from vllm_ascend.models.glm5next.kda import AscendKDARecoverSSMBackend, Glm5NextLinearAttention
+    from vllm_ascend.models.glm5next.kda import Glm5NextLinearAttention
     from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention
 
     assert AscendGatedDeltaNetAttention.get_attn_backend(object()) is AscendGDNFusedAttentionBackend
@@ -345,9 +346,42 @@ def test_ascend_gdn_attention_uses_ascend_backend():
     assert (
         Glm5NextLinearAttention.get_attn_backend(SimpleNamespace(use_recoverssm=False)) is AscendGDNHostMetadataBackend
     )
-    assert Glm5NextLinearAttention.get_attn_backend(SimpleNamespace(use_recoverssm=True)) is AscendKDARecoverSSMBackend
+    assert (
+        Glm5NextLinearAttention.get_attn_backend(SimpleNamespace(use_recoverssm=True)) is AscendGDNHostMetadataBackend
+    )
     assert Glm5NextLinearAttention.use_contiguous_conv_indices
     assert AscendGDNAttentionBackend.get_builder_cls() is AscendGDNAttentionMetadataBuilder
+
+
+@pytest.mark.parametrize("model_type", ["kimi_k3", "qwen3_next", "glm5_next", "glm5_next_text"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_host_backend_selects_recoverssm_only_for_opted_in_glm(model_type, enabled):
+    from vllm_ascend.models.glm5next.recoverssm_metadata import AscendKDARecoverSSMMetadataBuilder
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type)),
+        additional_config={"kda_recoverssm": enabled},
+        use_v2_model_runner=True,
+        num_speculative_tokens=5,
+        speculative_config=SimpleNamespace(method="mtp"),
+        cache_config=SimpleNamespace(mamba_cache_mode="none", enable_prefix_caching=False, use_kda_recoverssm=False),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
+        ),
+        kv_transfer_config=None,
+    )
+    original_config = get_current_vllm_config_or_none()
+    recover = enabled and model_type in ("glm5_next", "glm5_next_text")
+    expected = AscendKDARecoverSSMMetadataBuilder if recover else AscendGDNHostMetadataBuilder
+    with set_current_vllm_config(config):
+        assert AscendGDNHostMetadataBackend.get_builder_cls() is expected
+        assert config.cache_config.use_kda_recoverssm is recover
+    assert get_current_vllm_config_or_none() is original_config
+
+
+def test_host_backend_without_current_config_keeps_native_builder(monkeypatch):
+    monkeypatch.setattr(ascend_gdn_attn_builder, "get_current_vllm_config_or_none", lambda: None)
+    assert AscendGDNHostMetadataBackend.get_builder_cls() is AscendGDNHostMetadataBuilder
 
 
 def test_fused_backend_selects_host_metadata_only_when_supported(monkeypatch):

@@ -8,7 +8,6 @@ from dataclasses import replace
 import torch
 from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
 
 from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
@@ -22,20 +21,21 @@ from vllm_ascend.ops.gdn_attn_builder import (
 from vllm_ascend.ops.triton.kda.recoverssm import KDARecoverSSMCommitContext
 
 
+@contextmanager
+def _disable_upstream_graph_staging(builder):
+    # Only the parent build uses CUDA-specific staging. Restore the real
+    # graph mode before preparing persistent NPU buffers, even on failure.
+    builder._ascend_full_graph = builder.use_full_cuda_graph
+    builder.use_full_cuda_graph = False
+    try:
+        yield
+    finally:
+        builder.use_full_cuda_graph = builder._ascend_full_graph
+        del builder._ascend_full_graph
+
+
 class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
-
-    @contextmanager
-    def _disable_upstream_graph_staging(self):
-        # Only the parent build uses CUDA-specific staging. Restore the real
-        # graph mode before preparing persistent NPU buffers, even on failure.
-        self._ascend_full_graph = self.use_full_cuda_graph
-        self.use_full_cuda_graph = False
-        try:
-            yield
-        finally:
-            self.use_full_cuda_graph = self._ascend_full_graph
-            del self._ascend_full_graph
 
     def _get_recoverssm_context(self):
         if self.recoverssm_context is None:
@@ -70,7 +70,7 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
             if num_decode_draft_tokens_cpu is not None:
                 num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu.clone()
                 num_decode_draft_tokens_cpu[num_actual_reqs:] = -1
-        with self._disable_upstream_graph_staging():
+        with _disable_upstream_graph_staging(self):
             metadata = super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
         metadata.non_spec_prefill_metadata = None
         metadata.non_spec_decode_metadata = None
@@ -149,13 +149,3 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
         metadata.spec_query_start_loc = starts
         metadata.num_accepted_tokens = accepted
         metadata.recoverssm_commit = replace(metadata.recoverssm_commit, state_indices=states, query_start_loc=starts)
-
-
-class AscendKDARecoverSSMBackend(GDNAttentionBackend):
-    @staticmethod
-    def get_name():
-        return "ASCEND_KDA_RECOVERSSM"
-
-    @staticmethod
-    def get_builder_cls():
-        return AscendKDARecoverSSMMetadataBuilder
