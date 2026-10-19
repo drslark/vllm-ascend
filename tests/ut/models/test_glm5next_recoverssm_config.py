@@ -11,7 +11,7 @@ from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm, va
 def make_config():
     return SimpleNamespace(
         additional_config={"kda_recoverssm": True},
-        speculative_config=SimpleNamespace(method="mtp"),
+        speculative_config=SimpleNamespace(),
         cache_config=SimpleNamespace(use_kda_recoverssm=False, mamba_cache_mode="none", enable_prefix_caching=False),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
@@ -53,7 +53,6 @@ def test_initialization_requires_speculative_decoding():
 @pytest.mark.parametrize(
     "section,field,value,message",
     [
-        ("speculative_config", "method", "eagle3", "requires MTP"),
         ("cache_config", "mamba_cache_mode", "align", "Mamba cache mode none"),
         ("cache_config", "enable_prefix_caching", True, "prefix caching disabled"),
         ("parallel_config", "pipeline_parallel_size", 2, "PP=1 and PCP=1"),

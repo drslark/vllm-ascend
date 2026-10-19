@@ -3,7 +3,7 @@
 Enable this experimental path with `--additional-config '{"kda_recoverssm": true}'`
 alongside speculative decoding. The default remains the native AscendC KDA path.
 
-Service configuration initialization requires MTP (`mtp` or `deepseek_mtp`),
+Service configuration initialization requires speculative decoding,
 PP/PCP/DCP=1, `--no-enable-prefix-caching`, Mamba cache mode `none`, and no KV
 transfer. `AscendConfig.derive_and_validate()` checks these constraints when
 initializing the service configuration. Model-state initialization only activates
@@ -14,7 +14,7 @@ only read the explicit switch.
 Boolean validation stays in `AscendConfig`; speculative-token validity stays
 in upstream configuration validation.
 
-The retained hardware evidence used five draft tokens with the settings above.
+The retained hardware evidence used MTP with five draft tokens and the settings above.
 Other execution combinations have not been validated.
 
 Existing end-to-end validation used Model Runner V2. Removing the runner-version

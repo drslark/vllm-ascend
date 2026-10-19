@@ -12,8 +12,6 @@ def use_glm_recoverssm(vllm_config: VllmConfig) -> bool:
 def validate_glm_recoverssm(vllm_config: VllmConfig) -> None:
     if vllm_config.speculative_config is None:
         raise ValueError("GLM RecoverSSM requires speculative decoding")
-    if vllm_config.speculative_config.method not in ("mtp", "deepseek_mtp"):
-        raise ValueError("GLM RecoverSSM currently requires MTP")
     cache = vllm_config.cache_config
     if cache.mamba_cache_mode != "none" or cache.enable_prefix_caching:
         raise ValueError("GLM RecoverSSM currently requires Mamba cache mode none and prefix caching disabled")
