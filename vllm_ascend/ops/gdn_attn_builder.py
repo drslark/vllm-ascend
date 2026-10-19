@@ -1091,7 +1091,8 @@ class AscendGDNHostMetadataBackend(AscendGDNAttentionBackend):
             "glm5_next_text",
         ):
             # The RecoverSSM builder imports these host descriptors. Resolve it
-            # lazily, after the GLM configuration has validated its opt-in path.
+            # lazily. Selection only reads the opt-in; model-state initialization
+            # validates and activates the shared worker/cache contract.
             from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
 
             if use_glm_recoverssm(vllm_config):

@@ -368,7 +368,7 @@ def test_host_backend_selects_recoverssm_only_for_opted_in_glm(model_type, enabl
     expected = AscendKDARecoverSSMMetadataBuilder if recover else AscendGDNHostMetadataBuilder
     with set_current_vllm_config(config):
         assert AscendGDNHostMetadataBackend.get_builder_cls() is expected
-        assert config.cache_config.use_kda_recoverssm is recover
+        assert not config.cache_config.use_kda_recoverssm
 
 
 def test_fused_backend_selects_host_metadata_only_when_supported(monkeypatch):

@@ -6,9 +6,12 @@ alongside speculative decoding. The default remains the native AscendC KDA path.
 The measured configuration used MTP with five draft tokens, PP/PCP/DCP=1,
 `--no-enable-prefix-caching`, Mamba cache mode `none`, and no KV transfer.
 These are the settings covered by the retained validation evidence; other
-combinations have not been validated. The enable helper reads the explicit
-switch and activates the shared cache contract without revalidating execution
-options.
+combinations have not been validated. The enable helper and backend selection
+only read the explicit switch. GLM model-state initialization checks once that
+speculative decoding is enabled and activates the shared cache contract before
+constructing the upstream state. It runs after target/draft configuration
+construction, which can reset the upstream cache flag. Other execution options
+are not revalidated here.
 
 Existing end-to-end validation used Model Runner V2. Removing the runner-version
 configuration gate does not establish support for other runners' post-sampling

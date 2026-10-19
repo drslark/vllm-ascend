@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
@@ -37,6 +38,7 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.models.glm5next.recoverssm_config import init_glm_recoverssm
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -77,8 +79,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     time right after that layer's KV load finishes.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
+        if vllm_config.model_config.hf_text_config.model_type in ("glm5_next", "glm5_next_text"):
+            init_glm_recoverssm(vllm_config)
+        super().__init__(vllm_config, *args, **kwargs)
         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
         self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None

@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_ascend.ascend_config import AscendConfig, SparseKVOffloadConfig
-from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
+from vllm_ascend.models.glm5next.recoverssm_config import init_glm_recoverssm, use_glm_recoverssm
 
 
 def make_config():
     return SimpleNamespace(
         additional_config={"kda_recoverssm": True},
+        speculative_config=SimpleNamespace(),
         cache_config=SimpleNamespace(use_kda_recoverssm=False),
     )
 
@@ -23,10 +26,21 @@ def test_default_does_not_change_native_cache_contract():
     config = make_config()
     config.additional_config = {}
     assert not use_glm_recoverssm(config)
+    init_glm_recoverssm(config)
     assert not config.cache_config.use_kda_recoverssm
 
 
 def test_enabled_activates_upstream_cache_and_worker_contract():
     config = make_config()
     assert use_glm_recoverssm(config)
+    assert not config.cache_config.use_kda_recoverssm
+    init_glm_recoverssm(config)
     assert config.cache_config.use_kda_recoverssm
+
+
+def test_initialization_requires_speculative_decoding():
+    config = make_config()
+    config.speculative_config = None
+    with pytest.raises(ValueError, match="requires speculative decoding"):
+        init_glm_recoverssm(config)
+    assert not config.cache_config.use_kda_recoverssm
