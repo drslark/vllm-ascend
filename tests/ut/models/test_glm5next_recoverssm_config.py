@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
+from vllm_ascend.ascend_config import AscendConfig, SparseKVOffloadConfig
 from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
 
 
@@ -19,6 +21,23 @@ def make_config():
         ),
         kv_transfer_config=None,
     )
+
+
+def test_ascend_configuration_defaults_recoverssm_off():
+    assert AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).kda_recoverssm is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ascend_configuration_accepts_recoverssm_boolean(enabled):
+    assert (
+        AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kda_recoverssm=enabled).kda_recoverssm is enabled
+    )
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", "false", None])
+def test_ascend_configuration_rejects_coerced_recoverssm_switch(value):
+    with pytest.raises(ValidationError, match="kda_recoverssm"):
+        AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kda_recoverssm=value)
 
 
 def test_default_does_not_change_native_cache_contract():
