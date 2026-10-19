@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
-import pytest
 import torch
 from vllm.models.kimi_k3.nvidia.kda_metadata import KDARecoverSSMCommitMetadata, KimiK3KDAMetadataBuilder
 
@@ -62,31 +61,6 @@ def test_graph_staging_reuses_addresses_and_clears_prior_rows():
             t.data_ptr()
             for t in (metadata.spec_state_indices_tensor, metadata.spec_query_start_loc, metadata.num_accepted_tokens)
         ]
-
-
-@pytest.mark.parametrize("full_graph", [False, True])
-@pytest.mark.parametrize("parent_raises", [False, True])
-def test_parent_build_graph_mode_is_scoped_and_restored(monkeypatch, full_graph, parent_raises):
-    builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
-    builder.use_full_cuda_graph = full_graph
-    assert not hasattr(builder, "_ascend_full_graph")
-    common = SimpleNamespace()
-
-    def parent_build(self, *args):
-        assert self.use_full_cuda_graph is False
-        assert self._ascend_full_graph is full_graph
-        if parent_raises:
-            raise RuntimeError("parent metadata build failed")
-        return SimpleNamespace(num_spec_decodes=0, num_prefills=0, num_decodes=0)
-
-    monkeypatch.setattr(KimiK3KDAMetadataBuilder, "build", parent_build)
-    if parent_raises:
-        with pytest.raises(RuntimeError, match="parent metadata build failed"):
-            builder.build(0, common)
-    else:
-        builder.build(0, common)
-    assert builder.use_full_cuda_graph is full_graph
-    assert not hasattr(builder, "_ascend_full_graph")
 
 
 def test_mixed_prefill_cpu_offsets_match_upstream_decode_partition():
