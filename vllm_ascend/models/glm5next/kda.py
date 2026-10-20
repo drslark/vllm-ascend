@@ -366,7 +366,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         non_spec_token_indx = attn_metadata_narrowed.non_spec_token_indx
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
-        use_spec = num_spec_decodes > 0 and spec_state_indices_tensor is not None
+        # RecoverSSM can omit sequence masks; state indices identify speculative cache pages.
+        has_spec_state_indices = spec_state_indices_tensor is not None
+        use_spec = num_spec_decodes > 0 and has_spec_state_indices
         # Safe-gate checkpoints use the bounded sigmoid variant.
         lower_bound = self.kda_lower_bound
         constant_caches = self.kv_cache
