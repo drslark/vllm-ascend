@@ -65,6 +65,7 @@ def make_sending_thread(
 def make_pull_scheduler() -> MooncakePullConnectorScheduler:
     scheduler = MooncakePullConnectorScheduler.__new__(MooncakePullConnectorScheduler)
     scheduler.need_truncate = False
+    scheduler._logged_mamba_allocation = False
     scheduler.num_speculative_tokens = 0
     scheduler.pcp_size = 1
     scheduler.dcp_size = 1
