@@ -359,15 +359,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = attn_metadata_narrowed.non_spec_state_indices_tensor  # noqa: E501
         num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
-        # Spec-decode metadata (all None when speculative decoding is disabled).
-        spec_query_start_loc = attn_metadata_narrowed.spec_query_start_loc
         spec_state_indices_tensor = attn_metadata_narrowed.spec_state_indices_tensor
+        # RecoverSSM can omit sequence masks; state indices identify speculative cache pages.
+        has_spec_state_indices = spec_state_indices_tensor is not None
+        spec_query_start_loc = attn_metadata_narrowed.spec_query_start_loc
         spec_token_indx = attn_metadata_narrowed.spec_token_indx
         non_spec_token_indx = attn_metadata_narrowed.non_spec_token_indx
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
-        # RecoverSSM can omit sequence masks; state indices identify speculative cache pages.
-        has_spec_state_indices = spec_state_indices_tensor is not None
         use_spec = num_spec_decodes > 0 and has_spec_state_indices
         # Safe-gate checkpoints use the bounded sigmoid variant.
         lower_bound = self.kda_lower_bound
