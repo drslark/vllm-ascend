@@ -134,10 +134,12 @@ class MooncakeBaseConnectorScheduler:
                 # state, not a prompt-aligned attention-block sequence.
                 transfer_block_ids.append(blocks)
             elif any(isinstance(spec, MambaSpec) for spec in group_specs):
-                if self.num_speculative_tokens > 0:
-                    transfer_block_ids.append(blocks[: -self.num_speculative_tokens])
-                else:
-                    transfer_block_ids.append(blocks)
+                # RecoverSSM stores its whole verify window in one state page,
+                # so draft tokens do not imply extra checkpoint blocks.
+                num_speculative_blocks = max(
+                    spec.num_speculative_blocks for spec in group_specs if isinstance(spec, MambaSpec)
+                )
+                transfer_block_ids.append(blocks[:-num_speculative_blocks] if num_speculative_blocks else blocks)
             else:
                 # SWA remains TP-sharded/replicated and keeps its original
                 # logical block size even when FullAttention uses DCP.
