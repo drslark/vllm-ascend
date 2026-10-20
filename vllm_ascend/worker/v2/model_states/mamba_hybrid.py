@@ -80,9 +80,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     """
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
-        if (
-            vllm_config.model_config.hf_text_config.model_type in ("glm5_next", "glm5_next_text")
-            and use_glm_recoverssm(vllm_config)
+        if vllm_config.model_config.hf_text_config.model_type in ("glm5_next", "glm5_next_text") and use_glm_recoverssm(
+            vllm_config
         ):
             # Target/draft config construction can reset this upstream flag.
             vllm_config.cache_config.use_kda_recoverssm = True
