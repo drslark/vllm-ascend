@@ -35,6 +35,8 @@ def _disable_upstream_graph_staging(builder):
 
 
 class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
+    # Only uniform decode NPU graph replay has been validated. Variable-length
+    # and mixed prefill/decode replay remain unvalidated, so do not inherit ALWAYS.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def _get_recoverssm_context(self):
