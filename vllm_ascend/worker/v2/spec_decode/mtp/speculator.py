@@ -19,6 +19,7 @@
 # handling lives in the base, gated by is_mla.
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
+from vllm_ascend.worker.v2.model_states.recoverssm import AscendRecoverSSMState
 from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import AscendAutoRegressiveSpeculator
 
 
@@ -26,4 +27,11 @@ class AscendMTPSpeculator(AscendAutoRegressiveSpeculator, MTPSpeculator):
     """Ascend MTP speculator (MLA draft). All MLA handling is in the base
     (AscendAutoRegressiveSpeculator)"""
 
-    pass
+    recoverssm_state: AscendRecoverSSMState | None = None
+
+    def propose(self, *args, **kwargs):
+        draft_tokens = super().propose(*args, **kwargs)
+        # Join target state commits after MTP and before KV transfer.
+        if self.recoverssm_state is not None:
+            self.recoverssm_state.wait_for_commit()
+        return draft_tokens
