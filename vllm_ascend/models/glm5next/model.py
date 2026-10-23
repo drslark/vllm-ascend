@@ -94,7 +94,7 @@ from .multimodal import (
     Glm5NextVisionTransformer,
 )
 from .ops.mhc_ops import hc_contract, hc_expand
-from .recoverssm_config import use_glm_recoverssm
+from .recoverssm_config import glm_recoverssm_backend, glm_recoverssm_record_shapes, use_glm_recoverssm
 
 
 def _get_glm5next_text_config(model_config):
@@ -939,9 +939,10 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts
             num_spec=num_spec,
         )
         if use_glm_recoverssm(vllm_config):
-            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+            shapes = MambaStateShapeCalculator.append_kda_recoverssm_record(
                 shapes, hf_config.linear_num_heads, hf_config.linear_head_dim, tp_size, num_spec + 1
             )
+            return glm_recoverssm_record_shapes(shapes, glm_recoverssm_backend(vllm_config))
         return shapes
 
     @classmethod

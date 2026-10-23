@@ -1,0 +1,7 @@
+pr: 5
+entries:
+  - category: feature
+    text: >-
+      Added an optional AscendC input-replay backend for experimental GLM RecoverSSM
+      using the existing RecurrentKda operator. Enable kda_recoverssm_backend=ascendc
+      with BF16 activations and FP32 checkpoints; the default remains triton.

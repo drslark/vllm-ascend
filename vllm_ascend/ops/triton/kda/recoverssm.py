@@ -8,7 +8,7 @@ verify/commit contracts. Q/K normalization follows the AscendC KDA kernel.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
@@ -689,6 +689,7 @@ def kda_recoverssm_verify(
 
 @dataclass
 class KDARecoverSSMCommitContext:
+    _extra_record_values: ClassVar[int] = 0
     conv_states: tuple[torch.Tensor, ...]
     conv_state_base_addrs: torch.Tensor
     conv_state_block_strides: torch.Tensor
@@ -756,7 +757,7 @@ class KDARecoverSSMCommitContext:
             num_blocks,
             num_heads,
             spec_query_len,
-            value_dim,
+            value_dim + cls._extra_record_values,
         )
         correction_ref = correction_caches[0]
         for correction_cache in correction_caches:
@@ -947,12 +948,17 @@ class KDARecoverSSMCommitContext:
             num_warps=4,
         )
 
+        self._commit_kda(state_indices, block_table is not None)
+
+    def _commit_kda(self, state_indices: torch.Tensor, align_mode: bool) -> None:
+        batch = state_indices.shape[0]
+        num_layers = len(self.checkpoints)
         state_ref = self.checkpoints[0]
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)
         # Commit can use twice the verify value tile after shortening state liveness.
         # Align mode keeps both final and boundary correction tiles live.
-        value_tile = RECOVERSSM_VALUE_TILE if block_table is not None else RECOVERSSM_VALUE_TILE * 2
+        value_tile = RECOVERSSM_VALUE_TILE if align_mode else RECOVERSSM_VALUE_TILE * 2
         block_v = min(triton.next_power_of_2(value_dim), value_tile)
         grid = (
             triton.cdiv(value_dim, block_v),
@@ -999,7 +1005,7 @@ class KDARecoverSSMCommitContext:
             BV=block_v,
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
-            ALIGN_MODE=block_table is not None,
+            ALIGN_MODE=align_mode,
             num_warps=4,
             num_stages=2,
         )

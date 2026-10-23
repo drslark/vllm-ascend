@@ -30,8 +30,13 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.models.glm5next.ops.causal_conv1d import causal_conv1d
 from vllm_ascend.models.glm5next.ops.kda import KDA_MAX_RECURRENT_TOKENS, chunk_kda, recurrent_kda
-from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
+from vllm_ascend.models.glm5next.recoverssm_config import (
+    glm_recoverssm_backend,
+    glm_recoverssm_record_shapes,
+    use_glm_recoverssm,
+)
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBackend
+from vllm_ascend.ops.kda_recoverssm import kda_recoverssm_verify_ascendc
 from vllm_ascend.ops.triton.kda.recoverssm import kda_recoverssm_verify
 from vllm_ascend.utils import vllm_version_is
 
@@ -143,9 +148,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             num_spec=self.num_spec,
         )
         if self.use_recoverssm:
-            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+            shapes = MambaStateShapeCalculator.append_kda_recoverssm_record(
                 shapes, self.num_heads, self.head_dim, self.tp_size, self.num_spec + 1
             )
+            return glm_recoverssm_record_shapes(shapes, self.recoverssm_backend)
         return shapes
 
     def __init__(
@@ -156,6 +162,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     ) -> None:
         # KDA projections remain BF16 because fp8 checkpoints omit their scales.
         self.use_recoverssm = use_glm_recoverssm(vllm_config)
+        self.recoverssm_backend = glm_recoverssm_backend(vllm_config)
         saved_quant_config = vllm_config.quant_config
         try:
             vllm_config.quant_config = None
@@ -505,7 +512,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 correction_cache, kg_cache = records
                 # One paged checkpoint per request; verification only records
                 # compact updates. MRV2 commits after rejection sampling.
-                spec_output = kda_recoverssm_verify(
+                verify = (
+                    kda_recoverssm_verify_ascendc if self.recoverssm_backend == "ascendc" else kda_recoverssm_verify
+                )
+                spec_output = verify(
                     rearrange(q_spec),
                     rearrange(k_spec),
                     rearrange(v_spec),

@@ -9,6 +9,7 @@ import torch
 from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
 from vllm.v1.attention.backend import AttentionCGSupport
 
+from vllm_ascend.models.glm5next.recoverssm_config import glm_recoverssm_backend
 from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
@@ -18,6 +19,7 @@ from vllm_ascend.ops.gdn_attn_builder import (
     _build_actual_seq_lengths,
     _build_non_spec_chunked_prefill_metadata,
 )
+from vllm_ascend.ops.kda_recoverssm import AscendCKDARecoverSSMCommitContext
 from vllm_ascend.ops.triton.kda.recoverssm import KDARecoverSSMCommitContext
 
 
@@ -40,7 +42,12 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
     def _get_recoverssm_context(self):
         if self.recoverssm_context is None:
             forward_context = self.vllm_config.compilation_config.static_forward_context
-            self.recoverssm_context = KDARecoverSSMCommitContext.create(
+            context_cls = (
+                AscendCKDARecoverSSMCommitContext
+                if glm_recoverssm_backend(self.vllm_config) == "ascendc"
+                else KDARecoverSSMCommitContext
+            )
+            self.recoverssm_context = context_cls.create(
                 [forward_context[name] for name in self.layer_names],
                 spec_query_len=self.num_spec + 1,
                 max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,

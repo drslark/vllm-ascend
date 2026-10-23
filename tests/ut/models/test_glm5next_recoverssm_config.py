@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.ascend_config import AscendConfig, SparseKVOffloadConfig
-from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm, validate_glm_recoverssm
+from vllm_ascend.models.glm5next.recoverssm_config import (
+    glm_recoverssm_backend,
+    use_glm_recoverssm,
+    validate_glm_recoverssm,
+)
 
 
 def make_config():
@@ -31,6 +35,16 @@ def test_default_does_not_change_native_cache_contract():
     config.additional_config = {}
     assert not use_glm_recoverssm(config)
     assert not config.cache_config.use_kda_recoverssm
+
+
+def test_native_backend_is_explicit_and_validated():
+    config = make_config()
+    assert glm_recoverssm_backend(config) == "triton"
+    config.additional_config["kda_recoverssm_backend"] = "ascendc"
+    assert glm_recoverssm_backend(config) == "ascendc"
+    config.additional_config["kda_recoverssm_backend"] = "megakda"
+    with pytest.raises(ValueError, match="must be triton or ascendc"):
+        validate_glm_recoverssm(config)
 
 
 @pytest.mark.parametrize("connector", [None, "MooncakeConnectorV2", "MooncakePullConnector"])

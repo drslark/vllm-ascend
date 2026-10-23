@@ -9,7 +9,23 @@ def use_glm_recoverssm(vllm_config: VllmConfig) -> bool:
     return vllm_config.additional_config.get("kda_recoverssm", False)
 
 
+def glm_recoverssm_backend(vllm_config: VllmConfig) -> str:
+    backend = vllm_config.additional_config.get("kda_recoverssm_backend", "triton")
+    if backend not in ("triton", "ascendc"):
+        raise ValueError("kda_recoverssm_backend must be triton or ascendc")
+    return backend
+
+
+def glm_recoverssm_record_shapes(shapes, backend):
+    if backend == "ascendc":
+        # Store raw V and beta instead of the affine correction vector.
+        conv, state, values, kg = shapes
+        return conv, state, (*values[:-1], values[-1] + 1), kg
+    return shapes
+
+
 def validate_glm_recoverssm(vllm_config: VllmConfig) -> None:
+    glm_recoverssm_backend(vllm_config)
     if vllm_config.speculative_config is None:
         raise ValueError("GLM RecoverSSM requires speculative decoding")
     cache = vllm_config.cache_config
