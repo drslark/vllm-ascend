@@ -428,6 +428,7 @@ class AscendConfig:
             "enable_kv_nz": false,
             "kv_pool_range_debug": false,
             "kda_recoverssm": false,
+            "kda_recoverssm_backend": "triton",
             "enable_mc2_hierarchy_comm": false,
             "enable_dsa_cp": false,
             "sfa_dcp_force_tmajor_restore": false,
@@ -579,6 +580,9 @@ class AscendConfig:
     kv_pool_range_debug: bool = False
     # Experimental GLM KDA state recovery; disabled by default.
     kda_recoverssm: StrictBool = False
+    # AscendC replays raw accepted inputs with the existing RecurrentKda op.
+    # Triton retains compact affine corrections and remains the default.
+    kda_recoverssm_backend: Literal["triton", "ascendc"] = "triton"
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False

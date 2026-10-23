@@ -10,10 +10,12 @@ import vllm_ascend.models.glm5next.kda as model_kda
 
 
 @pytest.mark.parametrize("recover", [False, True])
-def test_cache_spec_allocates_one_checkpoint_and_compact_records(recover):
+@pytest.mark.parametrize("backend", ["triton", "ascendc"])
+def test_cache_spec_allocates_one_checkpoint_and_compact_records(recover, backend):
     layer = model_kda.Glm5NextLinearAttention.__new__(model_kda.Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
     layer.use_recoverssm = recover
+    layer.recoverssm_backend = backend
     layer.tp_size, layer.num_heads, layer.head_dim, layer.num_spec, layer.conv_size = 4, 8, 128, 5, 4
     layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
     cache = SimpleNamespace(
@@ -30,7 +32,7 @@ def test_cache_spec_allocates_one_checkpoint_and_compact_records(recover):
     assert spec.shapes[1] == (2, 128, 128)
     assert len(spec.shapes) == len(spec.dtypes) == (4 if recover else 2)
     if recover:
-        assert spec.shapes[2:] == ((2, 6, 128), (2, 6, 256))
+        assert spec.shapes[2:] == ((2, 6, 129 if backend == "ascendc" else 128), (2, 6, 256))
         assert spec.dtypes == (torch.bfloat16, torch.float32, torch.float32, torch.bfloat16)
 
 
@@ -39,8 +41,9 @@ def test_cache_spec_allocates_one_checkpoint_and_compact_records(recover):
     [(False, False, False), (True, False, False), (True, True, False), (True, False, True), (True, True, True)],
 )
 @pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "ascendc"])
 def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
-    monkeypatch, speculative, spec_only, dim_first, recover
+    monkeypatch, speculative, spec_only, dim_first, recover, backend
 ):
     layer = model_kda.Glm5NextLinearAttention.__new__(model_kda.Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
@@ -49,6 +52,7 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
     layer.head_dim = layer.local_projection_size = 128
     layer.kda_lower_bound = -4.0
     layer.use_recoverssm = recover
+    layer.recoverssm_backend = backend
     layer.num_spec = 1
     state_shape = (8, 384, 6) if dim_first else (8, 6, 384)
     layer.kv_cache = (torch.zeros(state_shape, dtype=torch.bfloat16), torch.zeros(8, 1, 128, 128))
@@ -217,6 +221,7 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
         return recurrent(q, k, v, gate, beta, state, starts, indices)
 
     monkeypatch.setattr(model_kda, "kda_recoverssm_verify", verify)
+    monkeypatch.setattr(model_kda, "kda_recoverssm_verify_ascendc", verify)
     monkeypatch.setattr(model_kda, "chunk_kda", prefill)
     qkv = torch.arange(1, tokens + 1, dtype=torch.bfloat16)[:, None].expand(tokens, 384).clone()
     out = torch.full((1, tokens + 1, 1, 128), float("nan"), dtype=torch.bfloat16)

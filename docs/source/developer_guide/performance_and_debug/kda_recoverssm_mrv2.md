@@ -72,6 +72,43 @@ with six native checkpoints requiring 384 KiB. This excludes convolution,
 attention caches, allocator padding, and cache-group page alignment; actual
 pool memory and serving performance require measurements.
 
+## Optional AscendC input replay
+
+Use `--additional-config '{"kda_recoverssm": true, "kda_recoverssm_backend": "ascendc"}'`
+to run verification and accepted-prefix recovery with the existing
+`fla_npu.ops.ascendc.recurrent_kda` operator. The RecoverSSM backend defaults to
+`triton`. The AscendC backend requires BF16 activations, FP32 checkpoints,
+head dimension 128 and a verify width in `[1, 8]`. BF16 checkpoints are rejected
+before kernel execution: the installed native read-only implementation produced
+NaNs for that dtype during integration testing. Use `triton` for that cache dtype.
+
+AscendC verification sets `inplace_final_state=False` and
+`output_final_state=False`. It records raw K/V/gate/beta inputs rather than
+affine corrections. After rejection sampling, the existing commit plan maps
+sampler rows to checkpoint pages, clamps accepted lengths to the verified
+prefix and compacts convolution history. A device-side gather packs only
+accepted inputs; RecurrentKda replays those prefixes into the checkpoint.
+The scratch buffers are reused across layers on the caller's stream.
+
+The four-view page layout is preserved. The third view stores FP32 V plus one
+beta scalar per token/head (`[heads, width, 129]`); the fourth stores BF16 raw
+K/gate (`[heads, width, 256]`). At MTP5, this adds 24 bytes per head/page to the
+70 KiB checkpoint-plus-record footprint. Shared replay scratch costs
+`max_num_seqs * width * heads * (3 * 128 + 1) * 2` bytes plus int32 metadata.
+It does not scale with the number of layers or cache pages.
+
+Both PD services must use the same `kda_recoverssm_backend`: the Triton and
+AscendC record views have different shapes and meanings. Existing constraints
+on runners, cache mode, parallelism and connectors still apply. Model-level PD
+accuracy and serving performance need separate validation of this backend.
+
+This integrates the general RecurrentKda ABI. The Kimi K3
+[MegaKDA ReplaySSM recipe](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/kimi_k3/kimi_k3_inference_guide.md)
+also fuses projections and output processing and requires fixed Kimi dimensions
+and weights; that interface cannot be substituted for the GLM layer directly.
+Input replay reruns the recurrence of accepted tokens, so its performance tradeoff
+differs from Triton's affine recovery. A speedup is not assumed.
+
 Validation must cover multi-step mathematical recurrence, native AscendC
 small-norm inputs, strided pages, mixed sampler rows, convolution compaction,
 graph padding, graph replay, and per-position acceptance. MRV1 results from
